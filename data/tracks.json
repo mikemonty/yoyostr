@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "tracks": [
+    {
+      "id": "basics",
+      "title": "Basics of Yo-Yoing",
+      "description": "Slipknot, holding the yo-yo, sleeper fundamentals, setup and safety.",
+      "playlists": [
+        {
+          "platform": "youtube",
+          "url": "https://youtube.com/playlist?list=PLkTUXdpgkF3j_bb30C1i-3i8eK0HwHyuQ",
+          "label": "Basics of Yo-Yoing"
+        }
+      ],
+      "verification": "optional"
+    },
+    {
+      "id": "beginner",
+      "title": "Beginner Yo-Yo Tricks",
+      "description": "First trick set (easy wins).",
+      "playlists": [
+        {
+          "platform": "youtube",
+          "url": "https://youtube.com/playlist?list=PLkTUXdpgkF3iRs42csZNek6kt8wKT5Rbj",
+          "label": "Beginner Yo-Yo Tricks"
+        }
+      ],
+      "verification": "community_later"
+    },
+    {
+      "id": "intermediate",
+      "title": "Intermediate Yo-Yo Tricks",
+      "description": "More control, mounts, and trick vocabulary.",
+      "playlists": [
+        {
+          "platform": "youtube",
+          "url": "https://youtube.com/playlist?list=PLkTUXdpgkF3i2iDwbl4L87_6JGkRoT2YC",
+          "label": "Intermediate Yo-Yo Tricks"
+        }
+      ],
+      "verification": "community_later"
+    },
+    {
+      "id": "advanced",
+      "title": "Advanced Yo-Yo Tricks",
+      "description": "Harder tricks, combos, and technique.",
+      "playlists": [
+        {
+          "platform": "youtube",
+          "url": "https://youtube.com/playlist?list=PLkTUXdpgkF3h8rC87-5Ubb4dQlYeyKGqO",
+          "label": "Advanced Yo-Yo Tricks"
+        }
+      ],
+      "verification": "community_later"
+    }
+  ]
+}
