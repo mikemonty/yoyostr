@@ -4,19 +4,36 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>YoYoStr</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: system-ui; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
+      header h1 { margin: 0; font-size: 28px; }
+      header p { margin: 6px 0 0; opacity: .8; }
+      #tracks { display: grid; grid-template-columns: 1fr; gap: 12px; }
+      .track-card { border: 1px solid rgba(127,127,127,.35); border-radius: 12px; padding: 14px; }
+      .track-card h3 { margin: 0 0 6px; }
+      .track-card p { margin: 0 0 10px; opacity: .85; }
+      .track-links { display: flex; flex-wrap: wrap; gap: 10px; }
+      .track-links a { text-decoration: none; border-bottom: 1px solid rgba(127,127,127,.4); }
+      .muted { opacity: .7; }
+    </style>
   </head>
-  <body style="font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 0 16px;">
-    <h1>YoYoStr</h1>
-    <p>Learn yo-yo tricks. Prove it. Earn badges.</p>
+  <body>
+    <header>
+      <div>
+        <h1>YoYoStr</h1>
+        <p class="muted">Learn yo-yo tricks. Prove it. Earn badges.</p>
+      </div>
+      <button id="adminBtn" hidden>Admin</button>
+    </header>
 
-    <h2>Playlists</h2>
-    <ul>
-      <li><a href="https://youtube.com/playlist?list=PLkTUXdpgkF3j_bb30C1i-3i8eK0HwHyuQ" target="_blank" rel="noreferrer">Basics of Yo-Yoing</a></li>
-      <li><a href="https://youtube.com/playlist?list=PLkTUXdpgkF3iRs42csZNek6kt8wKT5Rbj" target="_blank" rel="noreferrer">Beginner Yo-Yo Tricks</a></li>
-      <li><a href="https://youtube.com/playlist?list=PLkTUXdpgkF3i2iDwbl4L87_6JGkRoT2YC" target="_blank" rel="noreferrer">Intermediate Yo-Yo Tricks</a></li>
-      <li><a href="https://youtube.com/playlist?list=PLkTUXdpgkF3h8rC87-5Ubb4dQlYeyKGqO" target="_blank" rel="noreferrer">Advanced Yo-Yo Tricks</a></li>
-    </ul>
+    <main>
+      <h2 style="margin: 0 0 12px;">Tracks</h2>
+      <div id="tracks"></div>
+      <p class="muted" style="margin-top: 18px;">Next: Nostr login + publishing + proofs.</p>
+    </main>
 
-    <p style="opacity:.7">Next: make this a real web app (PWA) + Nostr login + proofs.</p>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>
