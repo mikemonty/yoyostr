@@ -17,6 +17,7 @@ import {
   fetchBadgesCreatedBy,
   fetchBadgePrefs,
   fetchCommunityPosts,
+  fetchPostById,
   fetchProfile,
   fetchProfiles,
   fetchProofsForUnit,
@@ -342,6 +343,20 @@ function parseRoute(hash) {
       pubkeyHex = String(profileMatch[1] || "");
     }
     return { name: "profile_view", pubkeyHex };
+  }
+
+  if (path.startsWith("/post/")) {
+    let raw = path.slice("/post/".length);
+    const slash = raw.indexOf("/");
+    if (slash >= 0) raw = raw.slice(0, slash);
+    let eventId = "";
+    try {
+      eventId = decodeURIComponent(raw);
+    } catch {
+      eventId = String(raw || "");
+    }
+    eventId = eventId.trim();
+    if (eventId) return { name: "post_view", eventId };
   }
 
   const unitMatch = path.match(/^\/track\/([^/]+)\/unit\/([^/]+)\/?$/);
@@ -860,7 +875,8 @@ function renderEmbedArea(video) {
   return el("div", { class: "embed-box" }, [iframe]);
 }
 
-function renderPostCard(event) {
+function renderPostCard(event, { linkDate = false } = {}) {
+  const eventId = typeof event?.id === "string" ? event.id : "";
   const pubkeyHex = typeof event?.pubkey === "string" ? event.pubkey : "";
   const createdAt = typeof event?.created_at === "number" ? event.created_at : Number(event?.created_at);
   const content = typeof event?.content === "string" ? event.content : "";
@@ -870,6 +886,10 @@ function renderPostCard(event) {
 
   const authorLink = pubkeyHex ? `#/p/${encodeURIComponent(pubkeyHex)}` : "#/community";
   const authorText = pubkeyHex ? shortHex(pubkeyHex) : "unknown";
+  const whenEl =
+    linkDate && eventId
+      ? el("a", { class: "muted", href: `#/post/${encodeURIComponent(eventId)}`, text: when })
+      : el("span", { class: "muted", text: when });
 
   const avatar = el("img", {
     class: "avatar-pic",
@@ -885,7 +905,7 @@ function renderPostCard(event) {
   const meta = el("div", { class: "post-meta" }, [
     avatar,
     authorA,
-    el("span", { class: "muted", text: when }),
+    whenEl,
   ]);
   if (type) meta.append(el("span", { class: "badge", text: type }));
 
@@ -950,6 +970,25 @@ async function init() {
     const tracks = [];
     let tracksLoaded = false;
     const profilesByPubkey = new Map(); // pubkey -> profile object (kind 0)
+
+  const getSiteTitleBase = () => {
+    const host =
+      typeof window !== "undefined" && typeof window.location?.hostname === "string"
+        ? window.location.hostname.trim()
+        : "";
+    return host || "yoyostr.com";
+  };
+
+  const setPageTitle = (parts) => {
+    const base = getSiteTitleBase();
+    const segs = Array.isArray(parts) ? parts : [parts];
+    const cleaned = segs
+      .map((p) => (typeof p === "string" ? p.trim() : ""))
+      .filter(Boolean);
+    const next = [base, ...cleaned].join(" - ");
+    if (typeof document === "undefined") return;
+    if (document.title !== next) document.title = next;
+  };
 
   const updateNavUi = (route) => {
     const links = [
@@ -1498,6 +1537,7 @@ async function init() {
   };
 
   const renderHome = () => {
+    setPageTitle(["Learn"]);
     app.innerHTML = "";
     app.append(el("h2", { text: "Tracks", style: "margin: 0 0 12px;" }));
     if (!tracksLoaded) {
@@ -1511,6 +1551,7 @@ async function init() {
   };
 
   const renderCommunity = async () => {
+    setPageTitle(["Community"]);
     const seq = ++renderSeq;
     app.innerHTML = "";
     app.append(el("h2", { text: "Community", style: "margin: 0 0 12px;" }));
@@ -1664,7 +1705,7 @@ async function init() {
         return;
       }
       for (const ev of events) {
-        const card = renderPostCard(ev);
+        const card = renderPostCard(ev, { linkDate: true });
         const pubkeyHex = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
         const profile = pubkeyHex ? profilesByPubkey.get(pubkeyHex) : null;
         const authorEl = card.querySelector?.('[data-role="author"]');
@@ -1687,7 +1728,71 @@ async function init() {
     });
   };
 
+  const renderPostPermalink = async (eventId) => {
+    setPageTitle(["Post"]);
+    const seq = ++renderSeq;
+    app.innerHTML = "";
+
+    const back = el("a", { href: "#/community", text: "← Back" });
+    back.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      if (window.history.length > 1) window.history.back();
+      else window.location.hash = "#/community";
+    });
+
+    app.append(back);
+    app.append(el("h2", { text: "Post", style: "margin: 10px 0 12px;" }));
+
+    const box = el("div", {}, [el("p", { class: "muted", text: "Loading post…" })]);
+    app.append(box);
+
+    try {
+      const post = await fetchPostById(eventId, { timeoutMs: 6500 });
+      if (seq !== renderSeq) return;
+      box.innerHTML = "";
+
+      if (!post) {
+        box.append(el("p", { class: "muted", text: "Post not found (relay may not have it)." }));
+        return;
+      }
+
+      const card = renderPostCard(post);
+      box.append(card);
+
+      const pk = typeof post?.pubkey === "string" ? normalizeHexPubkey(post.pubkey) : "";
+      const applyProfile = () => {
+        const profile = pk ? profilesByPubkey.get(pk) : null;
+        const authorEl = card.querySelector?.('[data-role="author"]');
+        if (authorEl && pk) authorEl.textContent = getBestDisplayName(profile, pk);
+        const avatarEl = card.querySelector?.('[data-role="avatar"]');
+        const pic = getProfilePictureUrl(profile);
+        if (avatarEl && pic) {
+          avatarEl.src = pic;
+          avatarEl.style.display = "";
+        }
+      };
+
+      applyProfile();
+      if (pk && !profilesByPubkey.has(pk)) {
+        fetchProfiles([pk], { limit: 5 })
+          .then((batch) => {
+            const prof = batch?.[pk];
+            if (prof) profilesByPubkey.set(pk, prof);
+            if (seq !== renderSeq) return;
+            applyProfile();
+          })
+          .catch(() => {});
+      }
+    } catch (err) {
+      if (seq !== renderSeq) return;
+      box.innerHTML = "";
+      box.append(el("p", { class: "muted", text: `Failed to load post: ${err?.message || String(err)}` }));
+      box.append(el("pre", { style: "white-space: pre-wrap;", text: err?.stack || String(err) }));
+    }
+  };
+
   const renderBadges = async () => {
+    setPageTitle(["Badges"]);
     const seq = ++renderSeq;
     app.innerHTML = "";
     app.append(el("h2", { text: "Badges", style: "margin: 0 0 12px;" }));
@@ -1777,6 +1882,7 @@ async function init() {
   };
 
   const renderBadgeDetail = async (badgeAddress) => {
+    setPageTitle(["Badge"]);
     const seq = ++renderSeq;
     const address = typeof badgeAddress === "string" ? badgeAddress.trim() : "";
     app.innerHTML = "";
@@ -1804,6 +1910,8 @@ async function init() {
       box.append(el("p", { class: "muted", text: "Badge not found." }));
       return;
     }
+
+    setPageTitle(["Badge", def.name || shortHex(address) || "Badge"]);
 
     const recipients = new Set();
     for (const ev of awards) {
@@ -1898,6 +2006,7 @@ async function init() {
   };
 
   const renderProfile = async (pubkeyHex, options = {}) => {
+    setPageTitle(["Profile"]);
     const seq = ++renderSeq;
     const pubkey = normalizeHexPubkey(pubkeyHex);
     app.innerHTML = "";
@@ -1923,6 +2032,7 @@ async function init() {
 
     profileBox.innerHTML = "";
     const displayName = getBestDisplayName(profile, pubkey);
+    setPageTitle(["Profile", displayName]);
 
     const bannerUrl = getProfileBannerUrl(profile);
     if (bannerUrl) {
@@ -2346,7 +2456,7 @@ async function init() {
       }
       const pinnedSet = new Set(pinnedIds);
       for (const ev of ordered) {
-        const card = renderPostCard(ev);
+        const card = renderPostCard(ev, { linkDate: true });
         const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
         const cached = pk ? profilesByPubkey.get(pk) : null;
         const authorEl = card.querySelector?.('[data-role="author"]');
@@ -2399,6 +2509,7 @@ async function init() {
   };
 
   const renderTrack = async (trackId) => {
+    setPageTitle([trackId]);
     const seq = ++renderSeq;
     app.innerHTML = "";
 
@@ -2414,6 +2525,7 @@ async function init() {
       return;
     }
     const track = tracks.find((t) => String(t?.id || "") === trackId);
+    setPageTitle([typeof track?.title === "string" && track.title.trim() ? track.title : trackId]);
     if (track) app.append(renderTrackHeader(track));
     else app.append(el("p", { class: "muted", text: "Track not found." }));
 
@@ -2442,6 +2554,7 @@ async function init() {
   };
 
   const renderUnit = async (trackId, unitId) => {
+    setPageTitle([trackId, unitId]);
     const seq = ++renderSeq;
     app.innerHTML = "";
 
@@ -2463,9 +2576,15 @@ async function init() {
 
     const unit = units.find((u) => String(u?.unitId || "") === unitId);
     if (!unit) {
+      setPageTitle([trackId, unitId]);
       app.append(el("p", { class: "muted", text: "Unit not found." }));
       return;
     }
+
+    const track = tracks.find((t) => String(t?.id || "") === trackId);
+    const trackTitle = typeof track?.title === "string" && track.title.trim() ? track.title : trackId;
+    const unitTitle = typeof unit?.title === "string" && unit.title.trim() ? unit.title : unitId;
+    setPageTitle([trackTitle, unitTitle]);
 
     app.append(el("h2", { text: typeof unit.title === "string" ? unit.title : "Untitled unit", style: "margin: 0 0 6px;" }));
     if (unit?.deleted === true) app.append(el("p", { class: "muted", text: "This unit is soft-deleted." }));
@@ -2923,25 +3042,28 @@ async function init() {
       if (route.name === "community") return await renderCommunity();
       if (route.name === "badges") return await renderBadges();
       if (route.name === "badge_view") return await renderBadgeDetail(route.address);
+      if (route.name === "post_view") return await renderPostPermalink(route.eventId);
       if (route.name === "profile") {
-        if (!signedInPubkey) {
-          app.innerHTML = "";
-          app.append(el("h2", { text: "Your Profile", style: "margin: 0 0 12px;" }));
-          app.append(el("p", { class: "muted", text: "Sign in to view your profile." }));
-          return;
-        }
-        return await renderProfile(signedInPubkey, { isSelf: true });
-      }
-      if (route.name === "profile_view") return await renderProfile(route.pubkeyHex, { isSelf: false });
-      if (route.name === "not_found") {
+      if (!signedInPubkey) {
         app.innerHTML = "";
-        app.append(el("h2", { text: "Not Found", style: "margin: 0 0 12px;" }));
-        app.append(el("p", { class: "muted", text: `No route matches ${route.path}` }));
-        app.append(el("a", { href: "#/", text: "Go to Home" }));
+        app.append(el("h2", { text: "Your Profile", style: "margin: 0 0 12px;" }));
+        app.append(el("p", { class: "muted", text: "Sign in to view your profile." }));
+        setPageTitle(["Profile"]);
         return;
       }
-      renderHome();
-    };
+      return await renderProfile(signedInPubkey, { isSelf: true });
+    }
+    if (route.name === "profile_view") return await renderProfile(route.pubkeyHex, { isSelf: false });
+    if (route.name === "not_found") {
+      app.innerHTML = "";
+      app.append(el("h2", { text: "Not Found", style: "margin: 0 0 12px;" }));
+      app.append(el("p", { class: "muted", text: `No route matches ${route.path}` }));
+      app.append(el("a", { href: "#/", text: "Go to Home" }));
+      setPageTitle(["Not Found"]);
+      return;
+    }
+    renderHome();
+  };
 
     const renderRoute = async () => {
       try {

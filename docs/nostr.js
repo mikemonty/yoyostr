@@ -1079,6 +1079,18 @@ export async function fetchCommunityPosts(options = {}) {
   return events.slice(0, limit);
 }
 
+export async function fetchPostById(eventId, options = {}) {
+  const id = typeof eventId === "string" ? eventId.trim() : "";
+  if (!id) return null;
+
+  const filter = { ids: [id] };
+  const events = await fetchEventsFromRelays(filter, options);
+  const match = events.find((ev) => typeof ev?.id === "string" && ev.id === id) || null;
+  if (!match) return null;
+  if (toNumberOrNull(match.kind) !== 1) return null;
+  return match;
+}
+
 export async function fetchProfile(pubkeyHex, options = {}) {
   const pubkey = normalizeHexPubkey(pubkeyHex);
   if (!pubkey) return null;
