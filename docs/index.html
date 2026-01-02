@@ -4,35 +4,151 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>YoYoStr</title>
+    <link rel="icon" href="data:," />
     <style>
-      :root { color-scheme: light dark; }
-      body { font-family: system-ui; max-width: 900px; margin: 40px auto; padding: 0 16px; }
-      header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
+      :root {
+        color-scheme: light dark;
+        --page-bg: #f6f7fb;
+        --panel-bg: rgba(255,255,255,.85);
+        --panel-border: rgba(20,20,20,.12);
+        --text-muted: rgba(20,20,20,.64);
+        --header-bg: #121826;
+        --header-text: rgba(255,255,255,.92);
+        --header-muted: rgba(255,255,255,.72);
+        --link-underline: rgba(127,127,127,.4);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page-bg: #0b0f1a;
+          --panel-bg: rgba(18,24,38,.62);
+          --panel-border: rgba(255,255,255,.14);
+          --text-muted: rgba(255,255,255,.72);
+          --header-bg: #0a0f1a;
+          --header-text: rgba(255,255,255,.92);
+          --header-muted: rgba(255,255,255,.72);
+          --link-underline: rgba(255,255,255,.28);
+        }
+      }
+
+      body {
+        font-family: system-ui;
+        margin: 0;
+        background: radial-gradient(1200px 600px at 20% -10%, rgba(99,102,241,.18), transparent 55%),
+          radial-gradient(900px 500px at 90% 0%, rgba(34,211,238,.14), transparent 55%),
+          var(--page-bg);
+      }
+      .container { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+      .header-bar {
+        background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,0)) , var(--header-bg);
+        border-bottom: 1px solid rgba(255,255,255,.10);
+      }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 18px 0; }
       header h1 { margin: 0; font-size: 28px; }
-      header p { margin: 6px 0 0; opacity: .8; }
-      #tracks { display: grid; grid-template-columns: 1fr; gap: 12px; }
-      .track-card { border: 1px solid rgba(127,127,127,.35); border-radius: 12px; padding: 14px; }
+      header p { margin: 6px 0 0; color: var(--header-muted); }
+      header h1 { color: var(--header-text); letter-spacing: -0.02em; }
+      #app { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 24px 0 40px; }
+      .track-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; backdrop-filter: blur(10px); }
       .track-card h3 { margin: 0 0 6px; }
       .track-card p { margin: 0 0 10px; opacity: .85; }
       .track-links { display: flex; flex-wrap: wrap; gap: 10px; }
-      .track-links a { text-decoration: none; border-bottom: 1px solid rgba(127,127,127,.4); }
-      .muted { opacity: .7; }
+      .track-links a { text-decoration: none; border-bottom: 1px solid var(--link-underline); }
+      .muted { opacity: .85; color: var(--text-muted); }
+      #status { margin: 6px 0 16px; min-height: 1.2em; }
+      .crumbs { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+      .crumbs a { text-decoration: none; border-bottom: 1px solid var(--link-underline); }
+      .unit-list { display: grid; gap: 10px; padding: 0; list-style: none; margin: 0; }
+      .unit-row { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 12px; padding: 12px; display:flex; gap: 12px; align-items: center; text-decoration: none; color: inherit; backdrop-filter: blur(10px); }
+      .unit-row:hover { border-color: rgba(127,127,127,.45); background: rgba(127,127,127,.10); }
+      .unit-thumb { width: 120px; aspect-ratio: 16 / 9; border-radius: 10px; object-fit: cover; flex: none; background: rgba(127,127,127,.08); }
+      .unit-text { min-width: 0; display: grid; gap: 4px; }
+      .unit-title-row { display:flex; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; }
+      .unit-title { font-weight: 600; min-width: 0; }
+      .unit-type { font-size: 11px; opacity: .8; border: 1px solid rgba(127,127,127,.35); padding: 2px 6px; border-radius: 999px; }
+      .unit-desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .unit-meta { opacity: .75; font-size: 12px; }
+      .video-list { display: grid; gap: 8px; padding: 0; list-style: none; margin: 0; }
+      .video-list button { width: 100%; text-align: left; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--panel-border); background: var(--panel-bg); cursor: pointer; backdrop-filter: blur(10px); }
+      .video-list button[aria-current="true"] { border-color: rgba(127,127,127,.55); background: rgba(127,127,127,.16); }
+      .embed-box { border: 1px solid var(--panel-border); border-radius: 14px; overflow: hidden; background: var(--panel-bg); backdrop-filter: blur(10px); }
+      .embed-box iframe { width: 100%; height: min(55vh, 520px); border: 0; display: block; }
+      .topnav { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+      .topnav a {
+        text-decoration: none;
+        color: var(--header-muted);
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(255,255,255,.06);
+      }
+      .topnav a:hover { background: rgba(255,255,255,.10); }
+      .topnav a[aria-current="page"] { color: var(--header-text); border-color: rgba(255,255,255,.22); background: rgba(255,255,255,.12); font-weight: 650; }
+      .post-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 12px; display: grid; gap: 10px; backdrop-filter: blur(10px); }
+      .post-meta { display:flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12px; opacity: .9; }
+      .avatar-pic { width: 22px; height: 22px; border-radius: 999px; object-fit: cover; background: rgba(127,127,127,.08); border: 1px solid rgba(127,127,127,.25); flex: none; }
+      .badge { font-size: 11px; border: 1px solid rgba(127,127,127,.35); padding: 2px 7px; border-radius: 999px; opacity: .9; }
+      .badge-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+      .badge-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 12px; display: grid; grid-template-columns: 56px 1fr; gap: 10px; align-items: center; backdrop-filter: blur(10px); }
+      .badge-icon { width: 56px; height: 56px; border-radius: 14px; object-fit: cover; background: rgba(127,127,127,.08); border: 1px solid rgba(127,127,127,.25); display:flex; align-items:center; justify-content:center; font-weight: 700; }
+      .badge-icon--empty { font-size: 20px; opacity: .85; }
+      .badge-meta { min-width: 0; display: grid; gap: 4px; }
+      .badge-title { font-weight: 600; }
+      .composer { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 12px; display: grid; gap: 10px; backdrop-filter: blur(10px); }
+      .composer label { font-size: 12px; opacity: .85; display: grid; gap: 6px; }
+      .composer textarea { width: 100%; box-sizing: border-box; }
+      .profile-header { display:flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .profile-banner { width: 100%; aspect-ratio: 4 / 6; max-height: 520px; object-fit: cover; border-radius: 14px; background: rgba(127,127,127,.08); border: 1px solid rgba(127,127,127,.25); }
+      .profile-pic { width: 56px; height: 56px; border-radius: 999px; object-fit: cover; background: rgba(127,127,127,.08); border: 1px solid rgba(127,127,127,.25); }
+      dialog { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; backdrop-filter: blur(12px); }
+
+      button, input, textarea, select {
+        font: inherit;
+      }
+      button {
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(255,255,255,.08);
+        color: inherit;
+        border-radius: 12px;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+      button:hover { background: rgba(255,255,255,.12); }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      input, textarea, select {
+        border: 1px solid var(--panel-border);
+        background: rgba(255,255,255,.06);
+        color: inherit;
+        border-radius: 12px;
+        padding: 9px 10px;
+      }
+      a { color: inherit; }
     </style>
   </head>
   <body>
-    <header>
-      <div>
-        <h1>YoYoStr</h1>
-        <p class="muted">Learn yo-yo tricks. Prove it. Earn badges.</p>
+    <div class="header-bar">
+      <div class="container">
+        <header>
+          <div>
+            <h1>YoYoStr</h1>
+            <p>Learn yo-yo tricks. Prove it. Earn badges.</p>
+            <nav class="topnav" aria-label="Main">
+              <a href="#/" id="navLearn">Learn</a>
+              <a href="#/community" id="navCommunity">Community</a>
+              <a href="#/badges" id="navBadges">Badges</a>
+              <a href="#/profile" id="navProfile">Profile</a>
+            </nav>
+          </div>
+          <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <button id="signInBtn">Sign in</button>
+            <button id="signOutBtn" hidden>Sign out</button>
+            <button id="adminBtn" hidden>Admin</button>
+          </div>
+        </header>
       </div>
-      <button id="adminBtn" hidden>Admin</button>
-    </header>
+    </div>
 
-    <main>
-      <h2 style="margin: 0 0 12px;">Tracks</h2>
-      <div id="tracks"></div>
-      <p class="muted" style="margin-top: 18px;">Next: Nostr login + publishing + proofs.</p>
-    </main>
+    <div class="container">
+      <div id="app"></div>
+    </div>
 
     <script type="module" src="./app.js"></script>
   </body>
