@@ -36,7 +36,11 @@ function getYouTubeVideoId(url) {
   if (host === "youtu.be") return cleanYouTubeId(path.replace(/^\//, "").split("/")[0]);
   if (path === "/watch") return cleanYouTubeId(u.searchParams.get("v"));
   if (path.startsWith("/shorts/")) return cleanYouTubeId(path.split("/")[2]);
-  if (path.startsWith("/embed/")) return cleanYouTubeId(path.split("/")[2]);
+  if (path.startsWith("/embed/")) {
+    const candidate = cleanYouTubeId(path.split("/")[2]);
+    if (candidate === "videoseries") return null;
+    return candidate;
+  }
   return null;
 }
 
@@ -60,24 +64,22 @@ export function getEmbedInfo(url) {
 
   const videoId = getYouTubeVideoId(url);
   if (videoId) {
+    const params = new URLSearchParams({
+      rel: "0",
+      modestbranding: "1",
+      iv_load_policy: "3",
+      playsinline: "1",
+    });
     return {
       provider: "youtube",
-      embedUrl: `https://www.youtube-nocookie.com/embed/${videoId}`,
+      embedUrl: `https://www.youtube-nocookie.com/embed/${videoId}?${params.toString()}`,
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
       isEmbeddable: true,
     };
   }
 
-  if (path === "/playlist") {
-    const list = cleanYouTubeId(u.searchParams.get("list"));
-    if (!list) return { provider: "youtube", embedUrl: null, thumbnailUrl: null, isEmbeddable: false };
-    return {
-      provider: "youtube",
-      embedUrl: `https://www.youtube-nocookie.com/embed/videoseries?list=${encodeURIComponent(list)}`,
-      thumbnailUrl: null,
-      isEmbeddable: true,
-    };
-  }
+  // Don't embed playlist pages: the YouTube player shows an "Up next" queue and can auto-advance.
+  if (path === "/playlist") return { provider: "youtube", embedUrl: null, thumbnailUrl: null, isEmbeddable: false };
 
   return { provider: "youtube", embedUrl: null, thumbnailUrl: null, isEmbeddable: false };
 }
