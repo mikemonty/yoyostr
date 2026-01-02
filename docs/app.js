@@ -25,6 +25,7 @@ import {
   fetchTracksFromRelays,
   fetchUnitsFromRelays,
   fetchYoyostrPostsByAuthor,
+  fetchAssertionsForProof,
   publishBadgeAward,
   publishBadgeDefinition,
   publishBadgePrefs,
@@ -32,6 +33,8 @@ import {
 } from "./nostr.js";
 import { getEmbedInfo } from "./embed.js";
 import { clearStoredPubkey, getStoredPubkey, signInWithNip07 } from "./auth.js";
+
+const ASSERTION_THRESHOLD = 3;
 
 async function loadFallbackTracks() {
   const res = await fetch("./data/tracks.json", { cache: "no-store" });
@@ -320,6 +323,7 @@ function parseRoute(hash) {
   const cleaned = h.startsWith("#") ? h.slice(1) : h;
   const path = cleaned.startsWith("/") ? cleaned : cleaned ? `/${cleaned}` : "/";
 
+  if (/^\/learn\/?$/.test(path)) return { name: "learn" };
   if (/^\/community\/?$/.test(path)) return { name: "community" };
   if (/^\/badges\/?$/.test(path)) return { name: "badges" };
   const badgeMatch = path.match(/^\/badge\/([^/]+)\/?$/);
@@ -942,6 +946,7 @@ async function init() {
   const signInBtn = document.getElementById("signInBtn");
   const signOutBtn = document.getElementById("signOutBtn");
   let statusEl = document.getElementById("status");
+  const navHome = document.getElementById("navHome");
   const navLearn = document.getElementById("navLearn");
   const navCommunity = document.getElementById("navCommunity");
   const navBadges = document.getElementById("navBadges");
@@ -992,6 +997,7 @@ async function init() {
 
   const updateNavUi = (route) => {
     const links = [
+      [navHome, "home"],
       [navLearn, "learn"],
       [navCommunity, "community"],
       [navBadges, "badges"],
@@ -999,8 +1005,10 @@ async function init() {
     ];
     for (const [a, name] of links) {
       if (!a) continue;
-      const isLearn = route?.name === "home" || route?.name === "track" || route?.name === "unit";
+      const isHome = route?.name === "home";
+      const isLearn = route?.name === "learn" || route?.name === "track" || route?.name === "unit";
       const isCurrent =
+        (name === "home" && isHome) ||
         (name === "learn" && isLearn) ||
         route?.name === name ||
         (name === "badges" && (route?.name === "badges" || route?.name === "badge_view")) ||
@@ -1550,6 +1558,63 @@ async function init() {
     app.append(el("p", { class: "muted", text: "Next: Units + proofs + badges." }));
   };
 
+  const renderLanding = () => {
+    setPageTitle(["Home"]);
+    app.innerHTML = "";
+    app.append(el("h2", { text: "Welcome to YoYoStr", style: "margin: 0 0 12px;" }));
+    app.append(
+      el("p", {
+        text: "YoYoStr is a place for yo‑yo enthusiasts of all levels. We help you learn yo‑yo tricks, prove your mastery, earn badges, and connect with others who love to throw.",
+      })
+    );
+
+    app.append(el("h3", { text: "Learn and Progress", style: "margin: 18px 0 8px;" }));
+    app.append(
+      el("p", {
+        text: "Browse through curated tracks of lessons—from the basics to advanced combos. Each track contains video playlists so you can watch, practice, and build up your skills at your own pace.",
+      })
+    );
+
+    app.append(el("h3", { text: "Prove it & Earn Badges", style: "margin: 18px 0 8px;" }));
+    app.append(
+      el("p", {
+        text: "Once you’ve learned a trick, post a short clip of yourself performing it. Other members of the community can verify your clip. When enough people confirm your proof, you’ll automatically earn a digital badge that appears on your profile.",
+      })
+    );
+
+    app.append(el("h3", { text: "Join the Community", style: "margin: 18px 0 8px;" }));
+    app.append(
+      el("p", {
+        text: "Share clips, ask questions, and support fellow throwers. The Community section is where you can post tutorials, discussions, and proof videos, and browse what others have shared.",
+      })
+    );
+
+    app.append(el("h3", { text: "Build Your Yo‑Yo Profile", style: "margin: 18px 0 8px;" }));
+    app.append(
+      el("p", {
+        text: "Your profile showcases all the badges you’ve earned and the tricks you’ve mastered. It’s your personal yo‑yo résumé—perfect for tracking progress and celebrating achievements.",
+      })
+    );
+
+    app.append(el("h3", { text: "Powered by Nostr", style: "margin: 18px 0 8px;" }));
+    app.append(
+      el("p", {
+        text: "YoYoStr is built on the open Nostr protocol. This means your posts, proofs and badges are published to a network of decentralised relays rather than one central server. You retain control of your data; your achievements live on the network, independent of any single website.",
+      })
+    );
+
+    app.append(el("h3", { text: "Get Started", style: "margin: 18px 0 8px;" }));
+    app.append(
+      el("p", {}, [
+        "Sign in with a Nostr-compatible browser extension (such as Alby), explore our ",
+        el("a", { href: "#/learn", text: "tracks" }),
+        ", and start your journey. Learn, prove, earn and connect—the yo‑yo community awaits! You can also jump into ",
+        el("a", { href: "#/community", text: "Community" }),
+        ".",
+      ])
+    );
+  };
+
   const renderCommunity = async () => {
     setPageTitle(["Community"]);
     const seq = ++renderSeq;
@@ -1782,6 +1847,228 @@ async function init() {
             applyProfile();
           })
           .catch(() => {});
+      }
+
+      // Proof verification assertions + auto awarding
+      const postType = getPostTypeFromTags(post?.tags);
+      if (postType === "proof") {
+        const proofId = typeof post?.id === "string" ? post.id : "";
+        const recipientPubkey = pk;
+        const tValues = getTagValues(post?.tags, "t");
+        const unitRef = tValues.find((t) => /^unit:[^:]+:[^:]+$/.test(t)) || "";
+        const trackTag = tValues.find((t) => t.startsWith("track:")) || "";
+
+        const threshold = ASSERTION_THRESHOLD;
+
+        const verifyBox = el("div", { class: "post-card", style: "margin-top: 12px; gap: 8px;" });
+        verifyBox.append(el("h3", { text: "Verification", style: "margin: 0;" }));
+
+        const countEl = el("div", { class: "muted" });
+        const verifyActions = el("div", { style: "display:flex; gap: 10px; align-items:center; flex-wrap: wrap;" });
+        const verifyBtn = el("button", { type: "button", text: "Verify this trick" });
+        const verifyStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+        const awardStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+
+        verifyActions.append(verifyBtn);
+        verifyBox.append(countEl, verifyActions, verifyStatus, awardStatus);
+        box.append(verifyBox);
+
+        let lastAssertions = [];
+        let awardInFlight = false;
+        let awardSucceeded = false;
+
+        const renderCounts = () => {
+          const count = Array.isArray(lastAssertions) ? lastAssertions.length : 0;
+          countEl.textContent = `Verifications: ${count} / ${threshold}`;
+        };
+
+        const refreshAssertions = async () => {
+          let assertions = [];
+          try {
+            assertions = await fetchAssertionsForProof(proofId, { limit: 200 });
+          } catch {
+            assertions = [];
+          }
+          if (seq !== renderSeq) return;
+          lastAssertions = assertions;
+          renderCounts();
+          return assertions;
+        };
+
+        const canVerify = () => {
+          const me = normalizeHexPubkey(signedInPubkey);
+          if (!me) return { ok: false, reason: "Sign in to verify." };
+          if (!recipientPubkey) return { ok: false, reason: "Missing proof author." };
+          if (me === recipientPubkey) return { ok: false, reason: "You can’t verify your own proof." };
+          const already = (lastAssertions || []).some(
+            (a) => normalizeHexPubkey(a?.pubkey) && normalizeHexPubkey(a.pubkey) === me
+          );
+          if (already) return { ok: false, reason: "You already verified this proof." };
+          if (!window.nostr || typeof window.nostr.signEvent !== "function") {
+            return { ok: false, reason: "Missing signer: Install/enable a Nostr signer (Alby)." };
+          }
+          return { ok: true, reason: "" };
+        };
+
+        const maybeAutoAward = async () => {
+          if (!unitRef || !recipientPubkey) return;
+          if (awardSucceeded) return;
+          const count = Array.isArray(lastAssertions) ? lastAssertions.length : 0;
+          if (count < threshold) return;
+          if (awardInFlight) return;
+
+          const me = normalizeHexPubkey(signedInPubkey);
+          if (!me) {
+            awardStatus.textContent = "Threshold met. Sign in to award the badge.";
+            return;
+          }
+          if (!window.nostr || typeof window.nostr.signEvent !== "function") {
+            awardStatus.textContent = "Threshold met. Missing signer (NIP-07) to award.";
+            return;
+          }
+
+          awardStatus.textContent = "Checking badge eligibility…";
+          let badgeDef = null;
+          try {
+            badgeDef = await fetchBadgeDefinitionForUnit(unitRef, { limit: 20 });
+          } catch {
+            badgeDef = null;
+          }
+          if (seq !== renderSeq) return;
+
+          let badgeAddress = typeof badgeDef?.address === "string" ? badgeDef.address : "";
+          if (!badgeAddress) {
+            const okCreate = window.confirm(
+              "No badge definition exists for this unit yet. Create one now so it can be awarded?"
+            );
+            if (!okCreate) {
+              awardStatus.textContent = "Threshold met, but no badge exists yet for this unit.";
+              return;
+            }
+
+            awardStatus.textContent = "Creating badge definition…";
+            try {
+              const maintainer = typeof MAINTAINER_PUBKEY_HEX === "string" ? MAINTAINER_PUBKEY_HEX.trim() : "";
+              const unitAddress = maintainer ? `30079:${maintainer}:${unitRef}` : "";
+              const badgeId = `badge:${unitRef}`;
+              const name = `YoYoStr: ${unitRef}`;
+              const { results } = await publishBadgeDefinition({
+                badgeId,
+                name,
+                description: "Auto-generated badge definition.",
+                imageUrl: "",
+                unitRef,
+                unitAddress,
+              });
+              const ok = Object.values(results || {}).some((r) => r?.ok);
+              if (!ok) throw new Error("Badge definition publish failed (no relays reported OK).");
+              badgeAddress = `30009:${me}:${badgeId}`;
+            } catch (err) {
+              awardStatus.textContent = `Badge creation failed: ${err?.message || String(err)}`;
+              return;
+            }
+          }
+
+          let awards = [];
+          try {
+            const res = await fetchAwardedBadges(recipientPubkey, { limit: 500 });
+            awards = Array.isArray(res?.awards) ? res.awards : [];
+          } catch {
+            awards = [];
+          }
+          if (seq !== renderSeq) return;
+
+          const alreadyHas = awards.some((ev) => getTagValues(ev?.tags, "a").includes(badgeAddress));
+          if (alreadyHas) {
+            awardStatus.textContent = "Badge already awarded to this user.";
+            awardSucceeded = true;
+            return;
+          }
+
+          awardInFlight = true;
+          awardStatus.textContent = "Awarding badge…";
+          try {
+            const { signedEvent, results } = await publishBadgeAward({
+              badgeAddress,
+              recipientPubkeyHex: recipientPubkey,
+              proofEventId: proofId,
+              unitRef,
+              note: "Auto-awarded (community assertions threshold met).",
+            });
+            logRelayResults("auto badge award publish results", results);
+            const ok = Object.values(results).some((r) => r?.ok);
+            awardStatus.textContent = ok ? `Badge awarded (${signedEvent.id}).` : "Award failed (no relays reported OK).";
+            if (ok) awardSucceeded = true;
+          } catch (err) {
+            awardStatus.textContent = `Award failed: ${err?.message || String(err)}`;
+          } finally {
+            awardInFlight = false;
+          }
+        };
+
+        const updateVerifyUi = () => {
+          const me = normalizeHexPubkey(signedInPubkey);
+          const isOwnProof = Boolean(me && recipientPubkey && me === recipientPubkey);
+          const already = Boolean(
+            me &&
+              (lastAssertions || []).some(
+                (a) => normalizeHexPubkey(a?.pubkey) && normalizeHexPubkey(a.pubkey) === me
+              )
+          );
+          verifyBtn.disabled = isOwnProof || already;
+          if (isOwnProof) verifyStatus.textContent = "You can’t verify your own proof.";
+          else if (already) verifyStatus.textContent = "You already verified this proof.";
+          else verifyStatus.textContent = "";
+        };
+
+        verifyBtn.addEventListener("click", async () => {
+          verifyStatus.textContent = "";
+          const status = canVerify();
+          if (!status.ok) {
+            verifyStatus.textContent = status.reason || "Cannot verify.";
+            return;
+          }
+
+          verifyBtn.disabled = true;
+          verifyStatus.textContent = "Signing assertion…";
+          try {
+            const me = normalizeHexPubkey(signedInPubkey);
+            const now = Math.floor(Date.now() / 1000);
+
+            const tags = [
+              ["t", APP_TAG],
+              ["t", "post"],
+              ["t", "type:assertion"],
+              ["e", proofId],
+              ["p", recipientPubkey],
+            ];
+            if (trackTag) tags.push(["t", trackTag]);
+            if (unitRef) tags.push(["t", unitRef]);
+
+            const unsignedEvent = {
+              kind: 1,
+              created_at: now,
+              tags,
+              content: "Verified.",
+              pubkey: me,
+            };
+            const signedEvent = await window.nostr.signEvent(unsignedEvent);
+            const results = await publishEventToRelays(RELAYS, signedEvent);
+            logRelayResults("assertion publish results", results);
+            const ok = Object.values(results).some((r) => r?.ok);
+            verifyStatus.textContent = ok ? `Verified (${signedEvent.id}).` : "Verify failed (no relays reported OK).";
+          } catch (err) {
+            verifyStatus.textContent = `Verify failed: ${err?.message || String(err)}`;
+          } finally {
+            await refreshAssertions();
+            updateVerifyUi();
+            await maybeAutoAward();
+          }
+        });
+
+        await refreshAssertions();
+        updateVerifyUi();
+        await maybeAutoAward();
       }
     } catch (err) {
       if (seq !== renderSeq) return;
@@ -3042,13 +3329,15 @@ async function init() {
       updateAuthUi();
       const route = parseRoute(window.location.hash);
       updateNavUi(route);
-      if (route.name === "track") return await renderTrack(route.trackId);
-      if (route.name === "unit") return await renderUnit(route.trackId, route.unitId);
-      if (route.name === "community") return await renderCommunity();
-      if (route.name === "badges") return await renderBadges();
-      if (route.name === "badge_view") return await renderBadgeDetail(route.address);
-      if (route.name === "post_view") return await renderPostPermalink(route.eventId);
-      if (route.name === "profile") {
+    if (route.name === "track") return await renderTrack(route.trackId);
+    if (route.name === "unit") return await renderUnit(route.trackId, route.unitId);
+    if (route.name === "home") return renderLanding();
+    if (route.name === "learn") return renderHome();
+    if (route.name === "community") return await renderCommunity();
+    if (route.name === "badges") return await renderBadges();
+    if (route.name === "badge_view") return await renderBadgeDetail(route.address);
+    if (route.name === "post_view") return await renderPostPermalink(route.eventId);
+    if (route.name === "profile") {
       if (!signedInPubkey) {
         app.innerHTML = "";
         app.append(el("h2", { text: "Your Profile", style: "margin: 0 0 12px;" }));
@@ -3067,7 +3356,7 @@ async function init() {
       setPageTitle(["Not Found"]);
       return;
     }
-    renderHome();
+    renderLanding();
   };
 
     const renderRoute = async () => {

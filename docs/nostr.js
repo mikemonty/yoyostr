@@ -1204,3 +1204,20 @@ export async function fetchProofsForUnit(unitRef, options = {}) {
   filtered.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
   return filtered.slice(0, limit);
 }
+
+export async function fetchAssertionsForProof(proofId, options = {}) {
+  const id = typeof proofId === "string" ? proofId.trim() : "";
+  if (!id) return [];
+
+  const limit = toNumberOrNull(options.limit) ?? 200;
+  const filter = { kinds: [1], "#e": [id], "#t": ["type:assertion", APP_TAG], limit };
+  const events = await fetchEventsFromRelays(filter, options);
+  const filtered = events.filter(
+    (ev) =>
+      hasTagValue(ev?.tags, "e", id) &&
+      hasTagValue(ev?.tags, "t", APP_TAG) &&
+      hasTagValue(ev?.tags, "t", "type:assertion")
+  );
+  filtered.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+  return filtered.slice(0, limit);
+}
