@@ -1641,6 +1641,23 @@ async function init() {
       }
       typeLabel.append(type);
 
+      const trackLabel = document.createElement("label");
+      trackLabel.textContent = "Track";
+      const track = document.createElement("select");
+      trackLabel.append(track);
+
+      const unitLabel = document.createElement("label");
+      unitLabel.textContent = "Unit";
+      const unit = document.createElement("select");
+      unit.disabled = true;
+      unitLabel.append(unit);
+
+      const proofFields = document.createElement("div");
+      proofFields.hidden = true;
+      proofFields.style.display = "grid";
+      proofFields.style.gap = "10px";
+      proofFields.append(trackLabel, unitLabel);
+
       const contentLabel = document.createElement("label");
       contentLabel.textContent = "Text";
       const content = document.createElement("textarea");
@@ -1654,12 +1671,82 @@ async function init() {
       videoUrl.placeholder = "https://youtu.be/…";
       urlLabel.append(videoUrl);
 
+      const setDefaultUnitOptions = () => {
+        unit.disabled = true;
+        setSelectOptions(unit, [{ value: "", label: "Select a track first…" }], "");
+      };
+
+      const setTrackOptions = (selectedTrackId) => {
+        const opts = tracksLoaded ? getTrackOptions() : [];
+        setSelectOptions(
+          track,
+          [
+            { value: "", label: tracksLoaded ? "Select a track…" : "Loading tracks…" },
+            ...opts,
+          ],
+          selectedTrackId
+        );
+      };
+
+      let unitLoadSeq = 0;
+      const setUnitOptions = async (trackId, selectedUnitId) => {
+        const tid = String(trackId || "").trim();
+        if (!tid) {
+          setDefaultUnitOptions();
+          return;
+        }
+
+        unit.disabled = true;
+        setSelectOptions(unit, [{ value: "", label: "Loading…" }], "");
+        const loadSeq = ++unitLoadSeq;
+        const units = await ensureUnits(tid);
+        if (loadSeq !== unitLoadSeq) return;
+
+        const opts = (Array.isArray(units) ? units : [])
+          .filter((u) => typeof u?.unitId === "string" && u.unitId.trim())
+          .map((u) => ({
+            value: u.unitId,
+            label: `${u.title || u.unitId} (${u.unitId})`,
+          }));
+        setSelectOptions(unit, [{ value: "", label: "Select a unit…" }, ...opts], selectedUnitId);
+        unit.disabled = false;
+      };
+
+      const syncProofFields = async () => {
+        const typeValue = String(type.value || "").trim();
+        const isProof = typeValue === "proof";
+        proofFields.hidden = !isProof;
+        if (!isProof) {
+          track.value = "";
+          setTrackOptions("");
+          setDefaultUnitOptions();
+          return;
+        }
+
+        setTrackOptions(track.value);
+        const trackId = String(track.value || "").trim();
+        if (!trackId) setDefaultUnitOptions();
+        else await setUnitOptions(trackId, unit.value);
+      };
+
       const publishBtn = document.createElement("button");
       publishBtn.type = "button";
       publishBtn.textContent = "Publish";
 
-      box.append(typeLabel, contentLabel, urlLabel, publishBtn, composerStatus);
+      box.append(typeLabel, proofFields, contentLabel, urlLabel, publishBtn, composerStatus);
       app.append(box);
+
+      setTrackOptions("");
+      setDefaultUnitOptions();
+      type.addEventListener("change", () => {
+        composerStatus.textContent = "";
+        syncProofFields();
+      });
+      track.addEventListener("change", () => {
+        composerStatus.textContent = "";
+        setUnitOptions(track.value, "");
+      });
+      syncProofFields();
 
       publishBtn.addEventListener("click", async () => {
         composerStatus.textContent = "";
@@ -1671,6 +1758,25 @@ async function init() {
         const typeValue = String(type.value || "discussion").trim() || "discussion";
         const text = String(content.value || "").trim();
         const url = String(videoUrl.value || "").trim();
+        if (typeValue === "proof" && !url) {
+          composerStatus.textContent = "Video URL is required.";
+          videoUrl.focus();
+          return;
+        }
+        if (typeValue === "proof") {
+          const trackId = String(track.value || "").trim();
+          if (!trackId) {
+            composerStatus.textContent = "Select a track.";
+            track.focus();
+            return;
+          }
+          const unitId = String(unit.value || "").trim();
+          if (!unitId) {
+            composerStatus.textContent = "Select a unit.";
+            unit.focus();
+            return;
+          }
+        }
         if (!text && !url) {
           composerStatus.textContent = "Add some text (or a video URL).";
           content.focus();
@@ -1684,6 +1790,15 @@ async function init() {
           ["t", `type:${typeValue}`],
         ];
         if (url) tags.push(["r", url]);
+        if (typeValue === "proof") {
+          const trackId = String(track.value || "").trim();
+          const unitId = String(unit.value || "").trim();
+          tags.push(["t", `track:${trackId}`]);
+          tags.push(["t", `unit:${trackId}:${unitId}`]);
+          if (typeof MAINTAINER_PUBKEY_HEX === "string" && MAINTAINER_PUBKEY_HEX.trim()) {
+            tags.push(["a", `30079:${MAINTAINER_PUBKEY_HEX.trim()}:unit:${trackId}:${unitId}`]);
+          }
+        }
 
         const now = Math.floor(Date.now() / 1000);
         const unsignedEvent = {
@@ -2083,6 +2198,13 @@ async function init() {
     const seq = ++renderSeq;
     app.innerHTML = "";
     app.append(el("h2", { text: "Badges", style: "margin: 0 0 12px;" }));
+    app.append(
+      el("p", {
+        class: "muted",
+        style: "margin: 0 0 16px;",
+        text: "Badges are digital achievements you earn by posting a proof of a trick and receiving enough verifications from the community. Once a proof meets the threshold, a badge is automatically awarded and appears on your profile.",
+      })
+    );
 
     const box = el("div", {}, [el("p", { class: "muted", text: "Loading badges…" })]);
     app.append(box);
@@ -2111,8 +2233,28 @@ async function init() {
       return;
     }
 
-    const grid = el("div", { class: "badge-grid" });
+    const categories = {
+      basic: [],
+      beginner: [],
+      intermediate: [],
+      advanced: [],
+      other: [],
+    };
+    const trackIdToCategory = {
+      basics: "basic",
+      beginner: "beginner",
+      intermediate: "intermediate",
+      advanced: "advanced",
+    };
+
     for (const def of defs) {
+      const unitRef = typeof def?.unitRef === "string" ? def.unitRef : "";
+      const unit = parseUnitRef(unitRef);
+      const category = trackIdToCategory[unit?.trackId] || "other";
+      (categories[category] || categories.other).push(def);
+    }
+
+    const makeBadgeCard = (def) => {
       const title = def?.name || "Badge";
       const address = def?.address || "";
       const href = address ? `#/badge/${encodeURIComponent(address)}` : "#/badges";
@@ -2163,9 +2305,22 @@ async function init() {
         meta.append(el("div", { class: "muted", text: unitRef }));
       }
       card.append(meta);
-      grid.append(card);
+      return card;
+    };
+
+    const categoryOrder = ["basic", "beginner", "intermediate", "advanced", "other"];
+    for (const key of categoryOrder) {
+      const list = Array.isArray(categories[key]) ? categories[key] : [];
+      const label = key === "other" ? "Other" : `${key.slice(0, 1).toUpperCase()}${key.slice(1)}`;
+
+      const details = el("details", { class: "badge-category" });
+      details.append(el("summary", { text: `${label} (${list.length})` }));
+
+      const grid = el("div", { class: "badge-grid" });
+      for (const def of list) grid.append(makeBadgeCard(def));
+      details.append(grid);
+      box.append(details);
     }
-    box.append(grid);
   };
 
   const renderBadgeDetail = async (badgeAddress) => {
