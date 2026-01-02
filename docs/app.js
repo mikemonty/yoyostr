@@ -2591,7 +2591,46 @@ async function init() {
     const description = typeof unit.description === "string" ? unit.description : "";
     if (description) app.append(el("p", { class: "muted", text: description }));
 
-    const unitActions = el("div", { style: "display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin: 6px 0 10px;" });
+    const renderUnitVideos = () => {
+      app.append(el("h3", { text: "Videos", style: "margin: 16px 0 10px;" }));
+
+      const videos = Array.isArray(unit.videos) ? unit.videos : [];
+      if (videos.length === 0) {
+        app.append(el("p", { class: "muted", text: "No videos yet." }));
+        return;
+      }
+
+      const unitKey = `${trackId}:${unitId}`;
+      const selectedIndex = Math.min(
+        Math.max(0, Number(selectedVideoByUnitKey.get(unitKey) ?? 0)),
+        videos.length - 1
+      );
+
+      const embedBox = el("div", {}, [renderEmbedArea(videos[selectedIndex])]);
+      const list = el("ul", { class: "video-list" });
+      videos.forEach((v, idx) => {
+        const label = typeof v?.title === "string" && v.title.trim() ? v.title : `Video ${idx + 1}`;
+        const url = typeof v?.url === "string" ? v.url : "";
+
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.setAttribute("aria-current", idx === selectedIndex ? "true" : "false");
+        btn.append(el("div", { text: label }));
+        btn.append(el("div", { class: "unit-meta", text: url || "—" }));
+        btn.addEventListener("click", () => {
+          selectedVideoByUnitKey.set(unitKey, idx);
+          renderUnit(trackId, unitId);
+        });
+        list.append(el("li", {}, [btn]));
+      });
+
+      app.append(embedBox);
+      app.append(list);
+    };
+
+    renderUnitVideos();
+
+    const unitActions = el("div", { style: "display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin: 16px 0 10px;" });
     const proofBtn = el("button", { type: "button", text: "Post proof" });
     proofBtn.disabled = !signedInPubkey;
     proofBtn.addEventListener("click", () =>
@@ -2997,40 +3036,6 @@ async function init() {
         renderProofsWithNames(proofsBox, proofs);
       })
       .catch(() => {});
-
-    const videos = Array.isArray(unit.videos) ? unit.videos : [];
-    if (videos.length === 0) {
-      app.append(el("p", { class: "muted", text: "No videos yet." }));
-      return;
-    }
-
-    const unitKey = `${trackId}:${unitId}`;
-    const selectedIndex = Math.min(
-      Math.max(0, Number(selectedVideoByUnitKey.get(unitKey) ?? 0)),
-      videos.length - 1
-    );
-
-    const embedBox = el("div", {}, [renderEmbedArea(videos[selectedIndex])]);
-    const list = el("ul", { class: "video-list" });
-    videos.forEach((v, idx) => {
-      const label = typeof v?.title === "string" && v.title.trim() ? v.title : `Video ${idx + 1}`;
-      const url = typeof v?.url === "string" ? v.url : "";
-
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.setAttribute("aria-current", idx === selectedIndex ? "true" : "false");
-      btn.append(el("div", { text: label }));
-      btn.append(el("div", { class: "unit-meta", text: url || "—" }));
-      btn.addEventListener("click", () => {
-        selectedVideoByUnitKey.set(unitKey, idx);
-        renderUnit(trackId, unitId);
-      });
-      list.append(el("li", {}, [btn]));
-    });
-
-    app.append(embedBox);
-    app.append(el("h3", { text: "Videos", style: "margin: 16px 0 10px;" }));
-    app.append(list);
   };
 
     const renderRouteUnsafe = async () => {
