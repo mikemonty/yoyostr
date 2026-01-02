@@ -1653,9 +1653,8 @@ async function init() {
       unitLabel.append(unit);
 
       const proofFields = document.createElement("div");
+      proofFields.className = "proof-fields";
       proofFields.hidden = true;
-      proofFields.style.display = "grid";
-      proofFields.style.gap = "10px";
       proofFields.append(trackLabel, unitLabel);
 
       const contentLabel = document.createElement("label");
@@ -1716,6 +1715,7 @@ async function init() {
         const typeValue = String(type.value || "").trim();
         const isProof = typeValue === "proof";
         proofFields.hidden = !isProof;
+        proofFields.style.display = isProof ? "grid" : "none";
         if (!isProof) {
           track.value = "";
           setTrackOptions("");
