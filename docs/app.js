@@ -18,12 +18,14 @@ import {
   fetchBadgePrefs,
   fetchCommunityPosts,
   fetchPostById,
+  fetchPostsByIds,
   fetchProfile,
   fetchProfiles,
   fetchProofsForUnit,
   fetchPinnedEventIds,
   fetchTracksFromRelays,
   fetchUnitsFromRelays,
+  fetchOtherPostsByAuthor,
   fetchYoyostrPostsByAuthor,
   fetchAssertionsForProof,
   publishBadgeAward,
@@ -35,7 +37,9 @@ import { getEmbedInfo } from "./embed.js";
 import {
   initAuth,
   getActiveAuthType,
+  getActiveAccountPubkey,
   getActivePubkey,
+  getActiveRemotePubkey,
   connectWithNip07,
   clearActiveAuth,
   canSign,
@@ -57,6 +61,7 @@ import {
   nip46WaitForConnect,
   nip46ConnectWithBunker,
   nip46RequestPublicKey,
+  nip46RequestSignEvent,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_PERMS,
 } from "./nip46.js";
@@ -64,6 +69,7 @@ import * as QRCode from "https://esm.sh/qrcode@1.5.3";
 import { nip19 } from "https://esm.sh/nostr-tools@2.7.2";
 
 const ASSERTION_THRESHOLD = 3;
+const PRIMAL_RELAY = "wss://relay.primal.net";
 
 async function loadFallbackTracks() {
   const res = await fetch("./data/tracks.json", { cache: "no-store" });
@@ -250,6 +256,101 @@ function getEmbeddableUrlForEvent(event) {
     if (info?.isEmbeddable && info?.embedUrl) return { url, info };
   }
   return null;
+}
+
+// Returns a best-effort title for a kind-1 event for search matching.
+function getEventTitle(event) {
+  const direct = typeof event?.title === "string" ? event.title.trim() : "";
+  if (direct) return direct;
+  const tagged = getTagValues(event?.tags, "title")[0] || getTagValues(event?.tags, "subject")[0] || "";
+  return typeof tagged === "string" ? tagged.trim() : "";
+}
+
+// Detects image URLs in content or "r" tags.
+function isImageEvent(event) {
+  const urls = [];
+  urls.push(...getTagValues(event?.tags, "r"));
+  urls.push(...extractUrlsFromText(event?.content));
+  for (const raw of urls) {
+    const url = typeof raw === "string" ? raw.trim() : "";
+    if (!url) continue;
+    const clean = url.split(/[?#]/)[0].toLowerCase();
+    if (clean.endsWith(".jpg") || clean.endsWith(".png") || clean.endsWith(".gif")) return true;
+  }
+  return false;
+}
+
+// Probe relays with a short websocket connect to find reachable ones.
+async function probeRelays(relays, timeoutMs = 1500) {
+  const raw = Array.isArray(relays) ? relays : [];
+  const unique = [];
+  const seen = new Set();
+  for (const relay of raw) {
+    const url = typeof relay === "string" ? relay.trim().replace(/\/+$/, "") : "";
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    unique.push(url);
+  }
+  if (unique.length === 0) return { okRelays: [], failedRelays: [] };
+
+  const checks = unique.map(
+    (url) =>
+      new Promise((resolve) => {
+        let settled = false;
+        let ws;
+        const finish = (ok) => {
+          if (settled) return;
+          settled = true;
+          try {
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+              ws.close(1000, "done");
+            }
+          } catch {
+            // ignore
+          }
+          resolve({ url, ok });
+        };
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        try {
+          ws = new WebSocket(url);
+        } catch {
+          clearTimeout(timer);
+          finish(false);
+          return;
+        }
+        ws.addEventListener("open", () => {
+          clearTimeout(timer);
+          finish(true);
+        });
+        ws.addEventListener("error", () => {
+          clearTimeout(timer);
+          finish(false);
+        });
+        ws.addEventListener("close", () => {
+          clearTimeout(timer);
+          finish(false);
+        });
+      })
+  );
+
+  const results = await Promise.all(checks);
+  const okRelays = results.filter((r) => r.ok).map((r) => r.url);
+  const failedRelays = results.filter((r) => !r.ok).map((r) => r.url);
+  return { okRelays, failedRelays };
+}
+
+// Classifies an event as video, image, or text based on embed/image detection.
+function getContentTypeForEvent(event) {
+  if (getEmbeddableUrlForEvent(event)) return "video";
+  if (isImageEvent(event)) return "image";
+  return "text";
+}
+
+// Builds a lowercase search string for filtering.
+function getSearchTextForEvent(event) {
+  const content = typeof event?.content === "string" ? event.content : "";
+  const title = getEventTitle(event);
+  return `${title} ${content}`.toLowerCase();
 }
 
 function setStatus(statusEl, message, options = {}) {
@@ -926,7 +1027,10 @@ function renderEmbedArea(video) {
   return el("div", { class: "embed-box" }, [iframe]);
 }
 
-function renderPostCard(event, { linkDate = false } = {}) {
+function renderPostCard(
+  event,
+  { linkDate = false, selectable = false, selected = false, selectionMode = false, compact = false } = {}
+) {
   const eventId = typeof event?.id === "string" ? event.id : "";
   const pubkeyHex = typeof event?.pubkey === "string" ? event.pubkey : "";
   const createdAt = typeof event?.created_at === "number" ? event.created_at : Number(event?.created_at);
@@ -961,6 +1065,10 @@ function renderPostCard(event, { linkDate = false } = {}) {
   if (type) meta.append(el("span", { class: "badge", text: type }));
 
   const card = el("article", { class: "post-card" }, [meta]);
+  if (compact) card.classList.add("post-card--compact");
+  if (selectable) card.classList.add("post-card--selectable");
+  if (selectionMode) card.classList.add("selection-mode");
+  if (selected) card.classList.add("is-selected");
   if (content) card.append(el("div", { style: "white-space: pre-wrap;" }, [document.createTextNode(content)]));
 
   const embed = getEmbeddableUrlForEvent(event);
@@ -974,6 +1082,14 @@ function renderPostCard(event, { linkDate = false } = {}) {
       referrerpolicy: "strict-origin-when-cross-origin",
     });
     card.append(el("div", { class: "embed-box" }, [iframe]));
+  }
+
+  if (selectable) {
+    const mark = el("span", { class: "post-select-mark", text: selected ? "x" : "" });
+    const checkbox = el("input", { type: "checkbox", class: "post-select-checkbox" });
+    checkbox.checked = Boolean(selected);
+    const overlay = el("div", { class: "post-select-overlay" }, [mark, checkbox]);
+    card.append(overlay);
   }
 
   return card;
@@ -1013,7 +1129,9 @@ async function init() {
 
   try {
     await initAuth();
-    let signedInPubkey = normalizeHexPubkey(getActivePubkey()) || null;
+    const initialAccountPubkey = normalizeHexPubkey(getActiveAccountPubkey());
+    const initialDisplayPubkey = normalizeHexPubkey(getActivePubkey());
+    let signedInPubkey = initialDisplayPubkey || initialAccountPubkey || null;
     let isMaintainer = false;
     let adminUi = null;
     let proofUi = null;
@@ -1068,11 +1186,15 @@ async function init() {
   };
 
   const updateAuthUi = () => {
-    const isSignedIn = Boolean(signedInPubkey);
     const authType = getActiveAuthType();
     const canSignNow = canSign();
     const hasNip07 = hasNip07Extension();
-    isMaintainer = normalizeHexPubkey(signedInPubkey) === normalizeHexPubkey(MAINTAINER_PUBKEY_HEX);
+    const accountPubkey = normalizeHexPubkey(getActiveAccountPubkey());
+    const remotePubkey = normalizeHexPubkey(getActiveRemotePubkey());
+    const displayPubkey = normalizeHexPubkey(getActivePubkey()) || signedInPubkey || null;
+    signedInPubkey = displayPubkey;
+    const isSignedIn = Boolean(displayPubkey);
+    isMaintainer = normalizeHexPubkey(displayPubkey) === normalizeHexPubkey(MAINTAINER_PUBKEY_HEX);
 
     if (adminBtn) adminBtn.hidden = !isMaintainer;
     if (adminBtn) adminBtn.disabled = !canSignNow;
@@ -1082,10 +1204,17 @@ async function init() {
     if (activeSignerLabel) {
       if (!isSignedIn) {
         activeSignerLabel.textContent = "";
+      } else if (authType === "nip46") {
+        if (accountPubkey) {
+          activeSignerLabel.textContent = `Connected as ${toNpub(accountPubkey)} (Remote signer)`;
+        } else if (remotePubkey) {
+          activeSignerLabel.textContent = `Connected as ${toNpub(remotePubkey)} (Signer key - temporary)`;
+        } else {
+          activeSignerLabel.textContent = "Connected via remote signer.";
+        }
       } else {
-        const labelType =
-          authType === "nip46" ? "Remote signer" : hasNip07 ? "Extension" : "Signer";
-        activeSignerLabel.textContent = `Connected as ${toNpub(signedInPubkey)} (${labelType})`;
+        const labelType = hasNip07 ? "Extension" : "Signer";
+        activeSignerLabel.textContent = `Connected as ${toNpub(displayPubkey)} (${labelType})`;
       }
     }
   };
@@ -1597,6 +1726,11 @@ async function init() {
     app.append(el("p", { class: "muted", text: "Next: Units + proofs + badges." }));
   };
 
+  // Manual auth test checklist:
+  // 1) Start local server, open auth page, generate QR, scan with Primal, approve.
+  // 2) Verify correct npub displayed and app loads.
+  // 3) Simulate relay failures by removing all but a dead relay; verify UI times out and offers Continue/Retry.
+  // 4) Verify "Continue anyway" loads app and later switches to correct account pubkey if resolved.
   const renderAuth = async (returnTo) => {
     setPageTitle(["Connect signer"]);
     app.innerHTML = "";
@@ -1651,6 +1785,16 @@ async function init() {
     );
 
     const remoteStatus = el("div", { class: "muted" });
+    const debugEnabled =
+      Boolean(window?.YOYOSTR_DEBUG) ||
+      new URLSearchParams(window.location.search || "").get("debug") === "1" ||
+      new URLSearchParams((window.location.hash.split("?")[1] || "").trim()).get("debug") === "1";
+    const debugBox = debugEnabled
+      ? el("div", {
+          class: "muted",
+          style: "margin-top:8px; font-size:12px; white-space:pre-wrap;",
+        })
+      : null;
     const qrBox = el("div", { class: "auth-qr" }, [
       el("span", { class: "muted", text: "Loading QR…" }),
     ]);
@@ -1662,6 +1806,8 @@ async function init() {
     });
     const copyBtn = el("button", { type: "button", text: "Copy" });
     const scannedBtn = el("button", { type: "button", text: "I scanned the QR" });
+    const continueBtn = el("button", { type: "button", text: "Continue anyway" });
+    continueBtn.hidden = true;
 
     const pasteInput = el("input", {
       type: "text",
@@ -1670,14 +1816,34 @@ async function init() {
     });
     const pasteBtn = el("button", { type: "button", text: "Connect" });
 
-    const buttonRow = el("div", { class: "auth-row" }, [copyBtn, scannedBtn]);
+    const buttonRow = el("div", { class: "auth-row" }, [copyBtn, scannedBtn, continueBtn]);
     const pasteRow = el("div", { class: "auth-row" }, [pasteInput, pasteBtn]);
-    remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus);
+    if (debugBox) {
+      remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus, debugBox);
+    } else {
+      remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus);
+    }
     grid.append(remotePanel);
 
     let waiting = false;
     let currentSession = null;
     let waitingController = null;
+    let resolvingAccount = false;
+    let lastRemotePubkey = null;
+    let needsSignatureConfirm = false;
+    const debugState = { relays: [], lastAction: "", resolvedPubkey: "" };
+
+    const setDebugState = (patch = {}) => {
+      if (!debugBox) return;
+      Object.assign(debugState, patch);
+      const lines = ["Debug"];
+      if (debugState.relays?.length) {
+        lines.push(`relays: ${debugState.relays.join(", ")}`);
+      }
+      if (debugState.lastAction) lines.push(`last action: ${debugState.lastAction}`);
+      if (debugState.resolvedPubkey) lines.push(`resolved pubkey: ${debugState.resolvedPubkey}`);
+      debugBox.textContent = lines.join("\n");
+    };
 
     const setRemoteStatus = (message, isError) => {
       remoteStatus.textContent = message || "";
@@ -1688,11 +1854,109 @@ async function init() {
       waiting = isWaiting;
       scannedBtn.disabled = isWaiting;
       pasteBtn.disabled = isWaiting;
+      continueBtn.disabled = isWaiting;
       copyBtn.disabled = !connectTextarea.value;
       if (!isWaiting && waitingController) {
         waitingController.abort();
         waitingController = null;
       }
+    };
+
+    const normalizeRelayList = (relays) => {
+      const list = Array.isArray(relays) ? relays : [];
+      const out = [];
+      const seen = new Set();
+      for (const relay of list) {
+        const url = typeof relay === "string" ? relay.trim().replace(/\/+$/, "") : "";
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        out.push(url);
+      }
+      return out;
+    };
+
+    const resolveAccountPubkey = async (sessionRecord, options = {}) => {
+      const attempts = Number.isFinite(options.attempts) ? options.attempts : 4;
+      const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5000;
+      const delayMs = Number.isFinite(options.delayMs) ? options.delayMs : 900;
+      for (let i = 0; i < attempts; i++) {
+        try {
+          setDebugState({ lastAction: `requested get_public_key (${i + 1}/${attempts})` });
+          const resolved = await nip46RequestPublicKey(sessionRecord, timeoutMs);
+          if (resolved) return resolved;
+        } catch {
+          // retry
+        }
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+      return null;
+    };
+
+    const requestSignaturePubkey = async (sessionRecord, timeoutMs = 5000) => {
+      try {
+        setRemoteStatus("Connected. Approve the signature request to confirm your account...");
+        setDebugState({ lastAction: "requested sign_event probe" });
+        const now = Math.floor(Date.now() / 1000);
+        const probeEvent = {
+          kind: 1,
+          created_at: now,
+          tags: [["t", "yoyostr-auth-probe"]],
+          content: "YoYoStr auth probe (not published).",
+          pubkey: "",
+        };
+        const signed = await nip46RequestSignEvent(sessionRecord, probeEvent, timeoutMs);
+        const pk = typeof signed?.pubkey === "string" ? signed.pubkey : "";
+        return pk || null;
+      } catch {
+        return null;
+      }
+    };
+
+    const applyNip46Auth = async (
+      sessionRecord,
+      { accountPubkey, remotePubkey, allowRemoteFallback = false } = {}
+    ) => {
+      const normalizedAccount = normalizeHexPubkey(accountPubkey);
+      const normalizedRemote = normalizeHexPubkey(remotePubkey);
+      const displayPubkey = normalizedAccount || (allowRemoteFallback ? normalizedRemote : null);
+      await setActiveAuth({
+        type: "nip46",
+        pubkey: normalizedAccount,
+        remotePubkey: normalizedRemote,
+        sessionId: sessionRecord.id,
+      });
+      signedInPubkey = displayPubkey;
+      updateAuthUi();
+      setStatus(statusEl, "Connected via remote signer.");
+      if (window.location.hash === backHref) {
+        await renderRoute();
+      } else {
+        window.location.hash = backHref;
+      }
+    };
+
+    const showContinueOption = (show) => {
+      continueBtn.hidden = !show;
+      if (!show) return;
+      continueBtn.disabled = false;
+    };
+
+    const tryResolveInBackground = (sessionRecord) => {
+      (async () => {
+        const resolved = await resolveAccountPubkey(sessionRecord, {
+          attempts: 6,
+          timeoutMs: 5000,
+          delayMs: 1000,
+        });
+        if (!resolved) return;
+        if (normalizeHexPubkey(resolved) === normalizeHexPubkey(signedInPubkey)) return;
+        await applyNip46Auth(sessionRecord, {
+          accountPubkey: resolved,
+          remotePubkey: sessionRecord?.remotePubkey || lastRemotePubkey,
+        });
+      })();
     };
 
     const finalizeRemoteConnect = async (session, remotePubkey) => {
@@ -1710,47 +1974,76 @@ async function init() {
         };
         await putNip46Session(sessionRecord);
       }
+      currentSession = sessionRecord;
+      lastRemotePubkey = remotePubkey;
+      needsSignatureConfirm = false;
 
-      await setActiveAuth({
-        type: "nip46",
-        pubkey: remotePubkey,
-        sessionId: session.id,
-      });
-      signedInPubkey = normalizeHexPubkey(remotePubkey);
-      updateAuthUi();
-      setStatus(statusEl, "Connected via remote signer.");
-      if (window.location.hash === backHref) {
-        await renderRoute();
-      } else {
-        window.location.hash = backHref;
-      }
+      if (resolvingAccount) return;
+      resolvingAccount = true;
+      scannedBtn.textContent = "Resolving account...";
+      scannedBtn.disabled = true;
+      pasteBtn.disabled = true;
+      continueBtn.disabled = true;
+      setRemoteStatus("Connected. Resolving account pubkey...");
+      setDebugState({ lastAction: "waiting for response..." });
 
-      // Resolve the account pubkey in the background so the UI can update without blocking login.
-      (async () => {
-        try {
-          const resolved = await nip46RequestPublicKey(sessionRecord, 5000);
-          if (!resolved) return;
-          if (normalizeHexPubkey(resolved) === normalizeHexPubkey(signedInPubkey)) return;
-          await setActiveAuth({
-            type: "nip46",
-            pubkey: resolved,
-            sessionId: sessionRecord.id,
-          });
-          signedInPubkey = normalizeHexPubkey(resolved);
-          updateAuthUi();
-          if (window.location.hash === backHref) {
-            await renderRoute();
-          }
-        } catch {
-          // ignore if the signer doesn't respond to get_public_key quickly
+      let uiTimeout;
+      try {
+        uiTimeout = setTimeout(() => {
+          if (!resolvingAccount) return;
+          setRemoteStatus("Still waiting on account pubkey. Retry or continue anyway.", true);
+          scannedBtn.textContent = "Retry account key";
+          scannedBtn.disabled = false;
+          pasteBtn.disabled = false;
+          showContinueOption(true);
+          resolvingAccount = false;
+        }, 7000);
+
+        const resolvedPubkey = await resolveAccountPubkey(sessionRecord, {
+          attempts: 4,
+          timeoutMs: 5000,
+          delayMs: 900,
+        });
+
+        if (!resolvedPubkey) {
+          needsSignatureConfirm = true;
+          setRemoteStatus(
+            "Connected, but couldn't read account pubkey. Request signature or continue anyway.",
+            true
+          );
+          scannedBtn.textContent = "Request signature";
+          scannedBtn.disabled = false;
+          pasteBtn.disabled = false;
+          showContinueOption(true);
+          return;
         }
-      })();
+
+        setDebugState({
+          lastAction: "resolved account pubkey",
+          resolvedPubkey: normalizeHexPubkey(resolvedPubkey),
+        });
+        scannedBtn.textContent = "I scanned the QR";
+        scannedBtn.disabled = false;
+        pasteBtn.disabled = false;
+        showContinueOption(false);
+        await applyNip46Auth(sessionRecord, {
+          accountPubkey: resolvedPubkey,
+          remotePubkey: sessionRecord?.remotePubkey || lastRemotePubkey,
+        });
+      } finally {
+        resolvingAccount = false;
+        if (uiTimeout) clearTimeout(uiTimeout);
+        scannedBtn.disabled = false;
+        pasteBtn.disabled = false;
+        if (!continueBtn.hidden) continueBtn.disabled = false;
+      }
     };
 
     const startWaiting = async (session) => {
       if (!session) return;
       setWaitingState(true);
-      setRemoteStatus("Waiting for approval on your phone…");
+      setRemoteStatus("Waiting for approval on your phone...");
+      setDebugState({ lastAction: "waiting for signer approval" });
       waitingController = new AbortController();
       try {
         const remotePubkey = await nip46WaitForConnect(
@@ -1762,15 +2055,42 @@ async function init() {
       } catch (err) {
         await updateNip46Session(session.id, { status: "failed" });
         setRemoteStatus(`Connect failed: ${err?.message || String(err)}`, true);
+      } finally {
         setWaitingState(false);
       }
     };
 
     const settings = await getSettings();
-    const relays = Array.isArray(settings?.relays) && settings.relays.length ? settings.relays : RELAYS;
-    currentSession = await ensurePendingNip46Session(relays, "qr");
-    if (!currentSession.relays?.length && relays.length) {
-      currentSession = await updateNip46Session(currentSession.id, { relays });
+    const settingsRelays =
+      Array.isArray(settings?.relays) && settings.relays.length ? settings.relays : RELAYS;
+    const baseRelays = normalizeRelayList([PRIMAL_RELAY, ...settingsRelays]);
+    let relays = baseRelays;
+    let okRelays = [];
+    let failedRelays = [];
+    try {
+      ({ okRelays, failedRelays } = await probeRelays(baseRelays, 1500));
+      if (okRelays.length) {
+        const primalOk = okRelays.includes(PRIMAL_RELAY);
+        relays = primalOk ? normalizeRelayList([PRIMAL_RELAY, ...okRelays]) : okRelays;
+      }
+      if (failedRelays.length && okRelays.length) {
+        setRemoteStatus(`Some relays were unreachable. Using ${okRelays.length} relay(s) for connect.`);
+      } else if (!okRelays.length && baseRelays.length) {
+        setRemoteStatus("Relays unreachable; QR connect may fail. Try again or edit relays.", true);
+      }
+    } catch {
+      relays = baseRelays;
+    }
+
+    const normalizedRelays = normalizeRelayList(relays);
+    setDebugState({ relays: normalizedRelays });
+    currentSession = await ensurePendingNip46Session(normalizedRelays, "qr");
+    const currentRelays = Array.isArray(currentSession?.relays) ? currentSession.relays : [];
+    const relaysMatch =
+      normalizedRelays.length === currentRelays.length &&
+      normalizedRelays.every((value, idx) => value === currentRelays[idx]);
+    if (normalizedRelays.length && !relaysMatch) {
+      currentSession = await updateNip46Session(currentSession.id, { relays: normalizedRelays });
     }
 
     const connectString = buildNostrConnectUri(currentSession, {
@@ -1807,8 +2127,55 @@ async function init() {
     });
 
     scannedBtn.addEventListener("click", async () => {
+      if (resolvingAccount) return;
       if (waiting) return;
+      if (currentSession?.status === "connected" && currentSession?.remotePubkey) {
+        if (needsSignatureConfirm) {
+          scannedBtn.disabled = true;
+          pasteBtn.disabled = true;
+          const signedPubkey = await requestSignaturePubkey(currentSession, 6000);
+          if (!signedPubkey) {
+            setRemoteStatus(
+              "Signature request failed. Retry or continue anyway to keep going.",
+              true
+            );
+            scannedBtn.textContent = "Request signature";
+            scannedBtn.disabled = false;
+            pasteBtn.disabled = false;
+            showContinueOption(true);
+            return;
+          }
+          needsSignatureConfirm = false;
+          setDebugState({
+            lastAction: "resolved account pubkey via signature",
+            resolvedPubkey: normalizeHexPubkey(signedPubkey),
+          });
+          await applyNip46Auth(currentSession, {
+            accountPubkey: signedPubkey,
+            remotePubkey: currentSession.remotePubkey,
+          });
+          return;
+        }
+        await finalizeRemoteConnect(currentSession, currentSession.remotePubkey);
+        return;
+      }
       await startWaiting(currentSession);
+    });
+
+    continueBtn.addEventListener("click", async () => {
+      if (!currentSession || !currentSession.remotePubkey) return;
+      setRemoteStatus(
+        "Connected using signer key (temporary). Still trying to resolve account...",
+        true
+      );
+      setDebugState({ lastAction: "continued with signer key" });
+      showContinueOption(false);
+      await applyNip46Auth(currentSession, {
+        accountPubkey: null,
+        remotePubkey: currentSession.remotePubkey,
+        allowRemoteFallback: true,
+      });
+      tryResolveInBackground(currentSession);
     });
 
     pasteBtn.addEventListener("click", async () => {
@@ -2928,339 +3295,834 @@ async function init() {
     const badgesBox = el("div", {}, [el("p", { class: "muted", text: "Loading badges…" })]);
     app.append(badgesBox);
 
-    let awarded = null;
-    let badgePrefs = null;
-    try {
-      [awarded, badgePrefs] = await Promise.all([fetchAwardedBadges(pubkey), fetchBadgePrefs(pubkey)]);
-    } catch {
-      awarded = { awards: [], definitionsByAddress: {} };
-      badgePrefs = null;
-    }
-    if (seq !== renderSeq) return;
-
-    const hiddenSet = new Set(Array.isArray(badgePrefs?.hidden) ? badgePrefs.hidden : []);
-    const latestAwardByAddr = new Map(); // addr -> { addr, def, awardAt }
-    for (const ev of awarded?.awards || []) {
-      const addr = getTagValues(ev?.tags, "a")[0] || "";
-      if (!addr) continue;
-      const awardAt = typeof ev?.created_at === "number" ? ev.created_at : Number(ev?.created_at) || 0;
-      const prev = latestAwardByAddr.get(addr);
-      if (!prev || awardAt > prev.awardAt) {
-        const def = awarded?.definitionsByAddress?.[addr] || null;
-        latestAwardByAddr.set(addr, { addr, def, awardAt });
+    const loadEarnedBadges = async () => {
+      let awarded = null;
+      let badgePrefs = null;
+      try {
+        [awarded, badgePrefs] = await Promise.all([fetchAwardedBadges(pubkey), fetchBadgePrefs(pubkey)]);
+      } catch {
+        awarded = { awards: [], definitionsByAddress: {} };
+        badgePrefs = null;
       }
-    }
+      if (seq !== renderSeq) return;
 
-    const earnedBadges = Array.from(latestAwardByAddr.values()).sort((a, b) => b.awardAt - a.awardAt);
-    const visibleBadges = earnedBadges.filter((b) => !hiddenSet.has(b.addr));
-
-    const renderBadgeCards = (badges, { editable } = {}) => {
-      badgesBox.innerHTML = "";
-      if (!Array.isArray(badges) || badges.length === 0) {
-        badgesBox.append(el("p", { class: "muted", text: "No badges yet." }));
-        return { checkboxByAddr: new Map() };
+      const hiddenSet = new Set(Array.isArray(badgePrefs?.hidden) ? badgePrefs.hidden : []);
+      const latestAwardByAddr = new Map(); // addr -> { addr, def, awardAt }
+      for (const ev of awarded?.awards || []) {
+        const addr = getTagValues(ev?.tags, "a")[0] || "";
+        if (!addr) continue;
+        const awardAt = typeof ev?.created_at === "number" ? ev.created_at : Number(ev?.created_at) || 0;
+        const prev = latestAwardByAddr.get(addr);
+        if (!prev || awardAt > prev.awardAt) {
+          const def = awarded?.definitionsByAddress?.[addr] || null;
+          latestAwardByAddr.set(addr, { addr, def, awardAt });
+        }
       }
 
-      const checkboxByAddr = new Map();
-      const grid = el("div", { class: "badge-grid" });
-      for (const b of badges) {
-        const title = b.def?.name || "Badge";
-        const unitRef = typeof b.def?.unitRef === "string" ? b.def.unitRef : "";
-        const unit = parseUnitRef(unitRef);
-        const unitHref =
-          unit && unit.trackId && unit.unitId
-            ? `#/track/${encodeURIComponent(unit.trackId)}/unit/${encodeURIComponent(unit.unitId)}`
-            : "";
+      const earnedBadges = Array.from(latestAwardByAddr.values()).sort((a, b) => b.awardAt - a.awardAt);
+      const visibleBadges = earnedBadges.filter((b) => !hiddenSet.has(b.addr));
 
-        const card = el("div", { class: "badge-card" });
-        if (b.def?.imageUrl) {
-          card.append(
-            el("img", {
-              class: "badge-icon",
-              src: b.def.imageUrl,
-              alt: "",
-              loading: "lazy",
-              decoding: "async",
-              referrerpolicy: "no-referrer",
-            })
-          );
-        } else {
-          card.append(el("div", { class: "badge-icon badge-icon--empty", text: "★" }));
+      const renderBadgeCards = (badges, { editable } = {}) => {
+        badgesBox.innerHTML = "";
+        if (!Array.isArray(badges) || badges.length === 0) {
+          badgesBox.append(el("p", { class: "muted", text: "No badges yet." }));
+          return { checkboxByAddr: new Map() };
         }
 
-        const meta = el("div", { class: "badge-meta" });
-        meta.append(el("div", { class: "badge-title", text: title }));
-        if (unitHref) meta.append(el("a", { href: unitHref, class: "muted", text: unitRef }));
-        else if (unitRef) meta.append(el("div", { class: "muted", text: unitRef }));
-        meta.append(el("div", { class: "muted", text: `Awarded: ${formatTimestamp(b.awardAt)}` }));
-        card.append(meta);
+        const checkboxByAddr = new Map();
+        const grid = el("div", { class: "badge-grid" });
+        for (const b of badges) {
+          const title = b.def?.name || "Badge";
+          const unitRef = typeof b.def?.unitRef === "string" ? b.def.unitRef : "";
+          const unit = parseUnitRef(unitRef);
+          const unitHref =
+            unit && unit.trackId && unit.unitId
+              ? `#/track/${encodeURIComponent(unit.trackId)}/unit/${encodeURIComponent(unit.unitId)}`
+              : "";
 
-        if (editable) {
-          const label = document.createElement("label");
-          label.className = "muted";
-          label.style.display = "flex";
-          label.style.alignItems = "center";
-          label.style.gap = "8px";
-          const cb = document.createElement("input");
-          cb.type = "checkbox";
-          cb.checked = !hiddenSet.has(b.addr);
-          label.append(cb, document.createTextNode("Show on profile"));
-          card.append(label);
-          checkboxByAddr.set(b.addr, cb);
+          const card = el("div", { class: "badge-card" });
+          if (b.def?.imageUrl) {
+            card.append(
+              el("img", {
+                class: "badge-icon",
+                src: b.def.imageUrl,
+                alt: "",
+                loading: "lazy",
+                decoding: "async",
+                referrerpolicy: "no-referrer",
+              })
+            );
+          } else {
+            card.append(el("div", { class: "badge-icon badge-icon--empty", text: "★" }));
+          }
+
+          const meta = el("div", { class: "badge-meta" });
+          meta.append(el("div", { class: "badge-title", text: title }));
+          if (unitHref) meta.append(el("a", { href: unitHref, class: "muted", text: unitRef }));
+          else if (unitRef) meta.append(el("div", { class: "muted", text: unitRef }));
+          meta.append(el("div", { class: "muted", text: `Awarded: ${formatTimestamp(b.awardAt)}` }));
+          card.append(meta);
+
+          if (editable) {
+            const label = document.createElement("label");
+            label.className = "muted";
+            label.style.display = "flex";
+            label.style.alignItems = "center";
+            label.style.gap = "8px";
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.checked = !hiddenSet.has(b.addr);
+            label.append(cb, document.createTextNode("Show on profile"));
+            card.append(label);
+            checkboxByAddr.set(b.addr, cb);
+          }
+
+          grid.append(card);
         }
+        badgesBox.append(grid);
+        return { checkboxByAddr };
+      };
 
-        grid.append(card);
-      }
-      badgesBox.append(grid);
-      return { checkboxByAddr };
-    };
-
-    const isOwnProfileForBadges = normalizeHexPubkey(signedInPubkey) === pubkey;
-    const { checkboxByAddr } = renderBadgeCards(isOwnProfileForBadges ? earnedBadges : visibleBadges, {
-      editable: isOwnProfileForBadges,
-    });
-
-    if (isOwnProfileForBadges) {
-      const saveRow = el("div", { style: "margin-top: 10px; display:flex; gap: 10px; align-items: center; flex-wrap: wrap;" });
-      const saveBtn = el("button", { type: "button", text: "Save badge display settings" });
-      const saveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
-      saveRow.append(saveBtn, saveStatus);
-      badgesBox.append(saveRow);
-
-      saveBtn.addEventListener("click", async () => {
-        saveStatus.textContent = "";
-        if (!canSign()) {
-          saveStatus.textContent = "Signer unavailable. Connect a signer.";
-          return;
-        }
-
-        const hidden = [];
-        for (const [addr, cb] of checkboxByAddr.entries()) {
-          if (!cb.checked) hidden.push(addr);
-        }
-
-        saveBtn.disabled = true;
-        saveStatus.textContent = "Signing…";
-        try {
-          const { signedEvent, results } = await publishBadgePrefs({ hidden });
-          logRelayResults("badge prefs publish results", results);
-          const ok = Object.values(results).some((r) => r?.ok);
-          saveStatus.textContent = ok ? `Saved (${signedEvent.id}).` : "Save failed (no relays reported OK).";
-        } catch (err) {
-          saveStatus.textContent = `Save failed: ${err?.message || String(err)}`;
-        } finally {
-          saveBtn.disabled = false;
-        }
-
-        await renderProfile(pubkey, options);
+      const isOwnProfileForBadges = normalizeHexPubkey(signedInPubkey) === pubkey;
+      const { checkboxByAddr } = renderBadgeCards(isOwnProfileForBadges ? earnedBadges : visibleBadges, {
+        editable: isOwnProfileForBadges,
       });
-    }
+
+      if (isOwnProfileForBadges) {
+        const saveRow = el("div", { style: "margin-top: 10px; display:flex; gap: 10px; align-items: center; flex-wrap: wrap;" });
+        const saveBtn = el("button", { type: "button", text: "Save badge display settings" });
+        const saveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+        saveRow.append(saveBtn, saveStatus);
+        badgesBox.append(saveRow);
+
+        saveBtn.addEventListener("click", async () => {
+          saveStatus.textContent = "";
+          if (!canSign()) {
+            saveStatus.textContent = "Signer unavailable. Connect a signer.";
+            return;
+          }
+
+          const hidden = [];
+          for (const [addr, cb] of checkboxByAddr.entries()) {
+            if (!cb.checked) hidden.push(addr);
+          }
+
+          saveBtn.disabled = true;
+          saveStatus.textContent = "Signing…";
+          try {
+            const { signedEvent, results } = await publishBadgePrefs({ hidden });
+            logRelayResults("badge prefs publish results", results);
+            const ok = Object.values(results).some((r) => r?.ok);
+            saveStatus.textContent = ok ? `Saved (${signedEvent.id}).` : "Save failed (no relays reported OK).";
+          } catch (err) {
+            saveStatus.textContent = `Save failed: ${err?.message || String(err)}`;
+          } finally {
+            saveBtn.disabled = false;
+          }
+
+          await renderProfile(pubkey, options);
+        });
+      }
+    };
+    loadEarnedBadges();
 
     app.append(el("h3", { text: "Badges created", style: "margin: 16px 0 10px;" }));
     const createdBadgesBox = el("div", {}, [el("p", { class: "muted", text: "Loading created badges…" })]);
     app.append(createdBadgesBox);
 
-    let createdBadges = [];
-    try {
-      createdBadges = await fetchBadgesCreatedBy(pubkey, { limit: 200 });
-    } catch {
-      createdBadges = [];
-    }
-    if (seq !== renderSeq) return;
-
-    createdBadgesBox.innerHTML = "";
-    if (!Array.isArray(createdBadges) || createdBadges.length === 0) {
-      createdBadgesBox.append(el("p", { class: "muted", text: "No created badges yet." }));
-    } else {
-      const grid = el("div", { class: "badge-grid" });
-      for (const def of createdBadges) {
-        const title = def?.name || "Badge";
-        const address = def?.address || "";
-        const href = address ? `#/badge/${encodeURIComponent(address)}` : "#/badges";
-
-        const unitRef = typeof def?.unitRef === "string" ? def.unitRef : "";
-        const unit = parseUnitRef(unitRef);
-        const unitHref =
-          unit && unit.trackId && unit.unitId
-            ? `#/track/${encodeURIComponent(unit.trackId)}/unit/${encodeURIComponent(unit.unitId)}`
-            : "";
-
-        const card = el("div", { class: "badge-card", style: "cursor:pointer;" });
-        card.tabIndex = 0;
-        const go = () => {
-          window.location.hash = href;
-        };
-        card.addEventListener("click", go);
-        card.addEventListener("keydown", (ev) => {
-          if (ev.key === "Enter" || ev.key === " ") go();
-        });
-
-        if (def?.imageUrl) {
-          card.append(
-            el("img", {
-              class: "badge-icon",
-              src: def.imageUrl,
-              alt: "",
-              loading: "lazy",
-              decoding: "async",
-              referrerpolicy: "no-referrer",
-            })
-          );
-        } else {
-          card.append(el("div", { class: "badge-icon badge-icon--empty", text: "★" }));
-        }
-
-        const meta = el("div", { class: "badge-meta" });
-        meta.append(el("div", { class: "badge-title", text: title }));
-        if (unitHref) {
-          const a = el("a", { href: unitHref, class: "muted", text: unitRef });
-          a.addEventListener("click", (ev) => {
-            ev.preventDefault();
-            ev.stopPropagation();
-            window.location.hash = unitHref;
-          });
-          meta.append(a);
-        } else if (unitRef) {
-          meta.append(el("div", { class: "muted", text: unitRef }));
-        }
-        if (address) meta.append(el("div", { class: "muted", text: shortHex(address) }));
-        card.append(meta);
-        grid.append(card);
-      }
-      createdBadgesBox.append(grid);
-    }
-
-    const postsBox = el("div", {}, [el("p", { class: "muted", text: "Loading posts…" })]);
-    app.append(el("h3", { text: "Posts", style: "margin: 16px 0 10px;" }));
-    app.append(postsBox);
-
-    let posts = [];
-    let pinnedIds = [];
-    try {
-      const [pinned, fetchedPosts] = await Promise.all([
-        fetchPinnedEventIds(pubkey).catch(() => []),
-        fetchYoyostrPostsByAuthor(pubkey, { limit: 50 }).catch(() => []),
-      ]);
-      pinnedIds = Array.isArray(pinned) ? pinned : [];
-      posts = Array.isArray(fetchedPosts) ? fetchedPosts : [];
-    } catch {
-      posts = [];
-      pinnedIds = [];
-    }
-    if (seq !== renderSeq) return;
-
-    const publishPins = async (nextPinnedIds) => {
+    const loadCreatedBadges = async () => {
+      let createdBadges = [];
       try {
-        window?.localStorage?.setItem(`yoyostr_pins_${pubkey}`, JSON.stringify(nextPinnedIds));
+        createdBadges = await fetchBadgesCreatedBy(pubkey, { limit: 200 });
       } catch {
-        // ignore
+        createdBadges = [];
       }
-      if (!isOwnProfile) return;
-      if (!canSign()) return;
+      if (seq !== renderSeq) return;
 
-      const now = Math.floor(Date.now() / 1000);
-      const unsignedEvent = {
-        kind: 10001,
-        created_at: now,
-        tags: nextPinnedIds.map((id) => ["e", id]),
-        content: "",
-        pubkey: normalizeHexPubkey(signedInPubkey),
-      };
-      let signedEvent;
-      try {
-        signedEvent = await signEvent(unsignedEvent);
-      } catch (err) {
-        setStatus(statusEl, `Pin sign failed: ${err?.message || String(err)}`, { error: true });
-        return;
-      }
-      const results = await publishEventToRelays(RELAYS, signedEvent);
-      const ok = Object.values(results).some((r) => r?.ok);
-      if (!ok) {
-        setStatus(statusEl, "Pin publish failed (no relays reported OK).", { error: true });
-        return;
-      }
-      setStatus(statusEl, "Pins updated.");
-    };
+      createdBadgesBox.innerHTML = "";
+      if (!Array.isArray(createdBadges) || createdBadges.length === 0) {
+        createdBadgesBox.append(el("p", { class: "muted", text: "No created badges yet." }));
+      } else {
+        const grid = el("div", { class: "badge-grid" });
+        for (const def of createdBadges) {
+          const title = def?.name || "Badge";
+          const address = def?.address || "";
+          const href = address ? `#/badge/${encodeURIComponent(address)}` : "#/badges";
 
-    const togglePin = async (eventId) => {
-      const id = typeof eventId === "string" ? eventId.trim() : "";
-      if (!id) return;
-      const existingIdx = pinnedIds.indexOf(id);
-      if (existingIdx >= 0) pinnedIds = pinnedIds.filter((x) => x !== id);
-      else pinnedIds = [id, ...pinnedIds.filter((x) => x !== id)].slice(0, 3);
-      renderPostsWithNames(postsBox, posts);
-      publishPins(pinnedIds);
-    };
+          const unitRef = typeof def?.unitRef === "string" ? def.unitRef : "";
+          const unit = parseUnitRef(unitRef);
+          const unitHref =
+            unit && unit.trackId && unit.unitId
+              ? `#/track/${encodeURIComponent(unit.trackId)}/unit/${encodeURIComponent(unit.unitId)}`
+              : "";
 
-    const orderPosts = (events) => {
-      if (!Array.isArray(events) || events.length === 0) return [];
-      if (!Array.isArray(pinnedIds) || pinnedIds.length === 0) return events;
-      const byId = new Map(events.map((ev) => [ev?.id, ev]));
-      const pinned = pinnedIds.map((id) => byId.get(id)).filter(Boolean);
-      const pinnedSet = new Set(pinnedIds);
-      const rest = events.filter((ev) => !pinnedSet.has(ev?.id));
-      return [...pinned, ...rest];
-    };
+          const card = el("div", { class: "badge-card", style: "cursor:pointer;" });
+          card.tabIndex = 0;
+          const go = () => {
+            window.location.hash = href;
+          };
+          card.addEventListener("click", go);
+          card.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") go();
+          });
 
-    const renderPostsWithNames = (container, events) => {
-      container.innerHTML = "";
-      const ordered = orderPosts(events);
-      if (!Array.isArray(ordered) || ordered.length === 0) {
-        container.append(el("p", { class: "muted", text: "No posts yet." }));
-        return;
-      }
-      const pinnedSet = new Set(pinnedIds);
-      for (const ev of ordered) {
-        const card = renderPostCard(ev, { linkDate: true });
-        const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
-        const cached = pk ? profilesByPubkey.get(pk) : null;
-        const authorEl = card.querySelector?.('[data-role="author"]');
-        if (authorEl && pk) authorEl.textContent = getBestDisplayName(cached, pk);
-        const avatarEl = card.querySelector?.('[data-role="avatar"]');
-        const pic = getProfilePictureUrl(cached);
-        if (avatarEl && pic) {
-          avatarEl.src = pic;
-          avatarEl.style.display = "";
-        }
-
-        if (ev?.id && pinnedSet.has(ev.id)) {
-          const meta = card.querySelector?.(".post-meta");
-          if (meta) meta.append(el("span", { class: "badge", text: "Pinned" }));
-        }
-        if (isOwnProfile && ev?.id) {
-          const meta = card.querySelector?.(".post-meta");
-          if (meta) {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.textContent = pinnedSet.has(ev.id) ? "Unpin" : "Pin";
-            btn.addEventListener("click", (e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              togglePin(ev.id);
-            });
-            meta.append(btn);
+          if (def?.imageUrl) {
+            card.append(
+              el("img", {
+                class: "badge-icon",
+                src: def.imageUrl,
+                alt: "",
+                loading: "lazy",
+                decoding: "async",
+                referrerpolicy: "no-referrer",
+              })
+            );
+          } else {
+            card.append(el("div", { class: "badge-icon badge-icon--empty", text: "★" }));
           }
+
+          const meta = el("div", { class: "badge-meta" });
+          meta.append(el("div", { class: "badge-title", text: title }));
+          if (unitHref) {
+            const a = el("a", { href: unitHref, class: "muted", text: unitRef });
+            a.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              window.location.hash = unitHref;
+            });
+            meta.append(a);
+          } else if (unitRef) {
+            meta.append(el("div", { class: "muted", text: unitRef }));
+          }
+          if (address) meta.append(el("div", { class: "muted", text: shortHex(address) }));
+          card.append(meta);
+          grid.append(card);
         }
-        container.append(card);
+        createdBadgesBox.append(grid);
       }
     };
-    renderPostsWithNames(postsBox, posts);
-    fetchProfiles(
-      Array.from(new Set(posts.map((ev) => (typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "")).filter(Boolean))).slice(
-        0,
-        40
-      ),
-      { limit: 120 }
-    )
-      .then((batch) => {
-        for (const [pubkey, prof] of Object.entries(batch || {})) {
+    loadCreatedBadges();
+
+    const loadPostsSection = async () => {
+      app.append(el("h3", { text: "Posts", style: "margin: 16px 0 10px;" }));
+
+      const postsTabs = isOwnProfile ? el("div", { class: "post-tabs" }) : null;
+      const yoyostrTabBtn = isOwnProfile
+        ? el("button", { type: "button", text: "YoYoStr Posts", "aria-current": "true" })
+        : null;
+      const otherTabBtn = isOwnProfile
+        ? el("button", { type: "button", text: "Other Posts", "aria-current": "false" })
+        : null;
+      if (postsTabs) {
+        postsTabs.append(yoyostrTabBtn, otherTabBtn);
+        app.append(postsTabs);
+      }
+
+      const yoyostrPane = el("div");
+      const otherPane = el("div", { hidden: true });
+      app.append(yoyostrPane);
+      if (isOwnProfile) app.append(otherPane);
+
+      const postsBox = el("div", {}, [el("p", { class: "muted", text: "Loading posts…" })]);
+      yoyostrPane.append(postsBox);
+
+      const selectedOtherBox = el("div", { style: "margin-top: 12px;" });
+      const selectedOtherTitle = el("h4", { text: "Selected Other Posts", style: "margin: 16px 0 10px;" });
+      const selectedOtherList = el("div", { class: "post-list" });
+      selectedOtherBox.append(selectedOtherTitle, selectedOtherList);
+      if (isOwnProfile) yoyostrPane.append(selectedOtherBox);
+
+      const ensureProfilesForEvents = async (events) => {
+        const pubkeys = Array.from(
+          new Set(
+            (Array.isArray(events) ? events : [])
+              .map((ev) => (typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : ""))
+              .filter(Boolean)
+          )
+        );
+        const missing = pubkeys.filter((pk) => !profilesByPubkey.has(pk));
+        if (missing.length === 0) return false;
+        let batch;
+        try {
+          batch = await fetchProfiles(missing.slice(0, 40), { limit: 120 });
+        } catch {
+          batch = {};
+        }
+        let changed = false;
+        for (const [pubkey, profile] of Object.entries(batch || {})) {
           const pk = normalizeHexPubkey(pubkey);
-          if (pk) profilesByPubkey.set(pk, prof);
+          if (!pk) continue;
+          profilesByPubkey.set(pk, profile);
+          changed = true;
+        }
+        return changed;
+      };
+
+      // Sync selection visuals on selectable post cards.
+      const updateSelectableCardState = (card, selected, selectionMode) => {
+        if (!card) return;
+        card.classList.toggle("is-selected", Boolean(selected));
+        card.classList.toggle("selection-mode", Boolean(selectionMode));
+        const mark = card.querySelector?.(".post-select-mark");
+        if (mark) mark.textContent = selected ? "x" : "";
+        const checkbox = card.querySelector?.(".post-select-checkbox");
+        if (checkbox) checkbox.checked = Boolean(selected);
+      };
+
+      // Render other posts with profile names/avatars and optional selection mode.
+      const renderOtherPostsWithNames = (container, events, options = {}) => {
+        const {
+          selectionMode = false,
+          selectedIds = new Set(),
+          viewMode = "list",
+          selectable = true,
+          onSelectionChange = null,
+        } = options;
+        container.innerHTML = "";
+        container.className = viewMode === "grid" ? "post-grid" : "post-list";
+        if (!Array.isArray(events) || events.length === 0) {
+          container.append(el("p", { class: "muted", text: "No posts yet." }));
+          return;
+        }
+        for (const ev of events) {
+          const eventId = typeof ev?.id === "string" ? ev.id : "";
+          const isSelected = eventId ? selectedIds.has(eventId) : false;
+          const showSelectionMode = selectable && selectionMode;
+          const card = renderPostCard(ev, {
+            linkDate: true,
+            selectable,
+            selected: isSelected,
+            selectionMode: showSelectionMode,
+            compact: viewMode === "grid",
+          });
+          const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
+          const cached = pk ? profilesByPubkey.get(pk) : null;
+          const authorEl = card.querySelector?.('[data-role="author"]');
+          if (authorEl && pk) authorEl.textContent = getBestDisplayName(cached, pk);
+          const avatarEl = card.querySelector?.('[data-role="avatar"]');
+          const pic = getProfilePictureUrl(cached);
+          if (avatarEl && pic) {
+            avatarEl.src = pic;
+            avatarEl.style.display = "";
+          }
+          if (selectable && eventId) {
+            card.addEventListener("click", (evClick) => {
+              if (!showSelectionMode) return;
+              if (evClick?.target?.closest?.("a")) {
+                evClick.preventDefault();
+                evClick.stopPropagation();
+              }
+              const nextSelected = !selectedIds.has(eventId);
+              if (nextSelected) selectedIds.add(eventId);
+              else selectedIds.delete(eventId);
+              updateSelectableCardState(card, nextSelected, showSelectionMode);
+              if (typeof onSelectionChange === "function") onSelectionChange(selectedIds);
+            });
+          }
+          container.append(card);
+        }
+      };
+
+      const selectedOtherStorageKey = `yoyostr_other_posts_${pubkey}`;
+      // Load selected other-post ids from local storage.
+      const readSelectedOtherPostIds = () => {
+        if (!isOwnProfile) return [];
+        try {
+          const raw = window?.localStorage?.getItem(selectedOtherStorageKey);
+          const parsed = raw ? JSON.parse(raw) : [];
+          return Array.isArray(parsed)
+            ? parsed.map((id) => (typeof id === "string" ? id.trim() : "")).filter(Boolean)
+            : [];
+        } catch {
+          return [];
+        }
+      };
+
+      const selectedOtherPostIds = new Set(readSelectedOtherPostIds());
+      const otherPostsById = new Map();
+
+      // Render saved other posts beneath the YoYoStr posts list.
+      const renderSelectedOtherPosts = (events) => {
+        if (!isOwnProfile) return;
+        selectedOtherList.innerHTML = "";
+        if (!Array.isArray(events) || events.length === 0) {
+          selectedOtherBox.hidden = false;
+          selectedOtherList.append(el("p", { class: "muted", text: "No selected other posts yet." }));
+          return;
+        }
+        selectedOtherBox.hidden = false;
+        renderOtherPostsWithNames(selectedOtherList, events, { viewMode: "list", selectable: false });
+      };
+
+      // Resolve saved other-post ids to full events for display.
+      const resolveSelectedOtherEvents = async () => {
+        const ids = Array.from(selectedOtherPostIds);
+        if (ids.length === 0) return [];
+        const fromCache = ids.map((id) => otherPostsById.get(id)).filter(Boolean);
+        if (fromCache.length === ids.length) return fromCache;
+        let fetched = [];
+        try {
+          fetched = await fetchPostsByIds(ids, { limit: ids.length });
+        } catch {
+          fetched = [];
+        }
+        const byId = new Map(fetched.map((ev) => [ev?.id, ev]));
+        const merged = ids
+          .map((id) => otherPostsById.get(id) || byId.get(id))
+          .filter(Boolean)
+          .sort((a, b) => (Number(b?.created_at) || 0) - (Number(a?.created_at) || 0));
+        return merged;
+      };
+
+      // Refresh selected other-posts list from saved ids.
+      const refreshSelectedOtherPosts = async () => {
+        if (!isOwnProfile) return;
+        if (selectedOtherPostIds.size === 0) {
+          renderSelectedOtherPosts([]);
+          return;
+        }
+        selectedOtherBox.hidden = false;
+        selectedOtherList.innerHTML = "";
+        selectedOtherList.append(el("p", { class: "muted", text: "Loading selected posts…" }));
+        const events = await resolveSelectedOtherEvents();
+        if (seq !== renderSeq) return;
+        renderSelectedOtherPosts(events);
+        ensureProfilesForEvents(events).then((changed) => {
+          if (!changed) return;
+          if (seq !== renderSeq) return;
+          renderSelectedOtherPosts(events);
+        });
+      };
+
+      let posts = [];
+      let pinnedIds = [];
+      try {
+        const [pinned, fetchedPosts] = await Promise.all([
+          fetchPinnedEventIds(pubkey).catch(() => []),
+          fetchYoyostrPostsByAuthor(pubkey, { limit: 50 }).catch(() => []),
+        ]);
+        pinnedIds = Array.isArray(pinned) ? pinned : [];
+        posts = Array.isArray(fetchedPosts) ? fetchedPosts : [];
+      } catch {
+        posts = [];
+        pinnedIds = [];
+      }
+      if (seq !== renderSeq) return;
+
+      const publishPins = async (nextPinnedIds) => {
+        try {
+          window?.localStorage?.setItem(`yoyostr_pins_${pubkey}`, JSON.stringify(nextPinnedIds));
+        } catch {
+          // ignore
+        }
+        if (!isOwnProfile) return;
+        if (!canSign()) return;
+
+        const now = Math.floor(Date.now() / 1000);
+        const unsignedEvent = {
+          kind: 10001,
+          created_at: now,
+          tags: nextPinnedIds.map((id) => ["e", id]),
+          content: "",
+          pubkey: normalizeHexPubkey(signedInPubkey),
+        };
+        let signedEvent;
+        try {
+          signedEvent = await signEvent(unsignedEvent);
+        } catch (err) {
+          setStatus(statusEl, `Pin sign failed: ${err?.message || String(err)}`, { error: true });
+          return;
+        }
+        const results = await publishEventToRelays(RELAYS, signedEvent);
+        const ok = Object.values(results).some((r) => r?.ok);
+        if (!ok) {
+          setStatus(statusEl, "Pin publish failed (no relays reported OK).", { error: true });
+          return;
+        }
+        setStatus(statusEl, "Pins updated.");
+      };
+
+      const togglePin = async (eventId) => {
+        const id = typeof eventId === "string" ? eventId.trim() : "";
+        if (!id) return;
+        const existingIdx = pinnedIds.indexOf(id);
+        if (existingIdx >= 0) pinnedIds = pinnedIds.filter((x) => x !== id);
+        else pinnedIds = [id, ...pinnedIds.filter((x) => x !== id)].slice(0, 3);
+        renderPostsWithNames(postsBox, posts);
+        publishPins(pinnedIds);
+      };
+
+      const orderPosts = (events) => {
+        if (!Array.isArray(events) || events.length === 0) return [];
+        if (!Array.isArray(pinnedIds) || pinnedIds.length === 0) return events;
+        const byId = new Map(events.map((ev) => [ev?.id, ev]));
+        const pinned = pinnedIds.map((id) => byId.get(id)).filter(Boolean);
+        const pinnedSet = new Set(pinnedIds);
+        const rest = events.filter((ev) => !pinnedSet.has(ev?.id));
+        return [...pinned, ...rest];
+      };
+
+      const renderPostsWithNames = (container, events) => {
+        container.innerHTML = "";
+        const ordered = orderPosts(events);
+        if (!Array.isArray(ordered) || ordered.length === 0) {
+          container.append(el("p", { class: "muted", text: "No posts yet." }));
+          return;
+        }
+        const pinnedSet = new Set(pinnedIds);
+        for (const ev of ordered) {
+          const card = renderPostCard(ev, { linkDate: true });
+          const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
+          const cached = pk ? profilesByPubkey.get(pk) : null;
+          const authorEl = card.querySelector?.('[data-role="author"]');
+          if (authorEl && pk) authorEl.textContent = getBestDisplayName(cached, pk);
+          const avatarEl = card.querySelector?.('[data-role="avatar"]');
+          const pic = getProfilePictureUrl(cached);
+          if (avatarEl && pic) {
+            avatarEl.src = pic;
+            avatarEl.style.display = "";
+          }
+
+          if (ev?.id && pinnedSet.has(ev.id)) {
+            const meta = card.querySelector?.(".post-meta");
+            if (meta) meta.append(el("span", { class: "badge", text: "Pinned" }));
+          }
+          if (isOwnProfile && ev?.id) {
+            const meta = card.querySelector?.(".post-meta");
+            if (meta) {
+              const btn = document.createElement("button");
+              btn.type = "button";
+              btn.textContent = pinnedSet.has(ev.id) ? "Unpin" : "Pin";
+              btn.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                togglePin(ev.id);
+              });
+              meta.append(btn);
+            }
+          }
+          container.append(card);
+        }
+      };
+
+      const refreshYoyostrPosts = () => {
+        renderPostsWithNames(postsBox, posts);
+        ensureProfilesForEvents(posts).then((changed) => {
+          if (!changed) return;
+          if (seq !== renderSeq) return;
+          renderPostsWithNames(postsBox, posts);
+        });
+      };
+
+      refreshYoyostrPosts();
+      if (isOwnProfile) refreshSelectedOtherPosts();
+
+      if (isOwnProfile) {
+      let otherPosts = [];
+      let otherPostsLoaded = false;
+      let otherPostsLoading = false;
+      let otherSearchQuery = "";
+      let otherFilterType = "all";
+      let otherViewMode = "list";
+      let otherSelectionMode = false;
+      let otherFetchUntil = null;
+      let otherHasMore = true;
+      const otherFetchLimit = 80;
+      let otherFetchInFlight = false;
+
+      const otherControls = el("div", { class: "post-controls" });
+      const searchInput = el("input", {
+        type: "search",
+        placeholder: "Search other posts…",
+        style: "min-width: 220px;",
+      });
+      const filterGroup = el("div", { class: "post-filter-group" });
+      const viewGroup = el("div", { class: "post-filter-group" });
+      const selectBtn = el("button", { type: "button", text: "Select" });
+      const displayBtn = el("button", { type: "button", text: "Display Selected" });
+      const otherStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+      const otherList = el("div", { class: "post-list" }, [
+        el("p", { class: "muted", text: "No other posts loaded yet." }),
+      ]);
+      const loadMoreRow = el("div", { class: "load-more-row" });
+      const loadMoreBtn = el("button", { type: "button", text: "Load more" });
+      const loadMoreHint = el("div", { class: "muted", text: "" });
+      loadMoreRow.append(loadMoreBtn, loadMoreHint);
+      const loadMoreSentinel = el("div", { class: "load-more-sentinel" });
+
+      otherControls.append(searchInput, filterGroup, viewGroup, selectBtn, displayBtn);
+      otherPane.append(otherControls, otherStatus, otherList, loadMoreRow, loadMoreSentinel);
+
+      const updateSelectionUi = () => {
+        selectBtn.textContent = otherSelectionMode ? "Done Selecting" : "Select";
+        displayBtn.disabled = selectedOtherPostIds.size === 0;
+        displayBtn.textContent = selectedOtherPostIds.size
+          ? `Display Selected (${selectedOtherPostIds.size})`
+          : "Display Selected";
+      };
+
+      const updateLoadMoreUi = () => {
+        loadMoreBtn.disabled = otherFetchInFlight || !otherHasMore;
+        if (otherFetchInFlight) loadMoreHint.textContent = "Loading…";
+        else if (!otherHasMore) loadMoreHint.textContent = "No more posts.";
+        else loadMoreHint.textContent = "";
+      };
+
+      // Persist selected other-post ids so they can be displayed on the profile.
+      const saveSelectedOtherPosts = async (eventIds) => {
+        const ids = Array.isArray(eventIds)
+          ? Array.from(
+              new Set(
+                eventIds
+                  .map((id) => (typeof id === "string" ? id.trim() : ""))
+                  .filter(Boolean)
+              )
+            )
+          : [];
+        selectedOtherPostIds.clear();
+        for (const id of ids) selectedOtherPostIds.add(id);
+        try {
+          window?.localStorage?.setItem(selectedOtherStorageKey, JSON.stringify(ids));
+        } catch {
+          // ignore
+        }
+        updateSelectionUi();
+        await refreshSelectedOtherPosts();
+      };
+
+      const setFilterButtons = (active) => {
+        for (const [value, btn] of filterButtons.entries()) {
+          btn.setAttribute("aria-pressed", value === active ? "true" : "false");
+        }
+      };
+
+      const setViewButtons = (active) => {
+        for (const [value, btn] of viewButtons.entries()) {
+          btn.setAttribute("aria-pressed", value === active ? "true" : "false");
+        }
+      };
+
+      const filterButtons = new Map();
+      const filterOptions = [
+        ["all", "All"],
+        ["video", "Videos"],
+        ["image", "Images"],
+        ["text", "Text"],
+      ];
+      for (const [value, label] of filterOptions) {
+        const btn = el("button", {
+          type: "button",
+          text: label,
+          "aria-pressed": value === otherFilterType ? "true" : "false",
+        });
+        btn.addEventListener("click", () => {
+          otherFilterType = value;
+          setFilterButtons(otherFilterType);
+          applyOtherFilters();
+        });
+        filterButtons.set(value, btn);
+        filterGroup.append(btn);
+      }
+
+      const viewButtons = new Map();
+      const viewOptions = [
+        ["list", "List"],
+        ["grid", "Grid"],
+      ];
+      for (const [value, label] of viewOptions) {
+        const btn = el("button", {
+          type: "button",
+          text: label,
+          "aria-pressed": value === otherViewMode ? "true" : "false",
+        });
+        btn.addEventListener("click", () => {
+          otherViewMode = value;
+          setViewButtons(otherViewMode);
+          applyOtherFilters();
+        });
+        viewButtons.set(value, btn);
+        viewGroup.append(btn);
+      }
+
+      const getFilteredOtherPosts = () => {
+        const query = otherSearchQuery.trim().toLowerCase();
+        const filtered = (Array.isArray(otherPosts) ? otherPosts : []).filter((ev) => {
+          if (otherFilterType !== "all") {
+            const type = getContentTypeForEvent(ev);
+            if (type !== otherFilterType) return false;
+          }
+          if (query) {
+            const haystack = getSearchTextForEvent(ev);
+            if (!haystack.includes(query)) return false;
+          }
+          return true;
+        });
+        return filtered;
+      };
+
+      const applyOtherFilters = () => {
+        const filtered = getFilteredOtherPosts();
+        renderOtherPostsWithNames(otherList, filtered, {
+          selectionMode: otherSelectionMode,
+          selectedIds: selectedOtherPostIds,
+          viewMode: otherViewMode,
+          selectable: true,
+          onSelectionChange: updateSelectionUi,
+        });
+        ensureProfilesForEvents(filtered).then((changed) => {
+          if (!changed) return;
+          if (seq !== renderSeq) return;
+          const latest = getFilteredOtherPosts();
+          renderOtherPostsWithNames(otherList, latest, {
+            selectionMode: otherSelectionMode,
+            selectedIds: selectedOtherPostIds,
+            viewMode: otherViewMode,
+            selectable: true,
+            onSelectionChange: updateSelectionUi,
+          });
+        });
+      };
+
+      const mergeOtherPosts = (events) => {
+        const list = Array.isArray(events) ? events : [];
+        let added = 0;
+        for (const ev of list) {
+          const id = typeof ev?.id === "string" ? ev.id : "";
+          if (!id || otherPostsById.has(id)) continue;
+          otherPostsById.set(id, ev);
+          otherPosts.push(ev);
+          added += 1;
+        }
+        if (added > 0) {
+          otherPosts.sort((a, b) => (Number(b?.created_at) || 0) - (Number(a?.created_at) || 0));
+        }
+        return added;
+      };
+
+      const updateOtherFetchCursor = () => {
+        if (otherPosts.length === 0) {
+          otherFetchUntil = null;
+          return;
+        }
+        const last = otherPosts[otherPosts.length - 1];
+        const lastAt = Number(last?.created_at) || 0;
+        otherFetchUntil = lastAt > 0 ? lastAt - 1 : null;
+      };
+
+      const loadMoreOtherPosts = async () => {
+        if (otherFetchInFlight) return;
+        if (!otherHasMore) {
+          updateLoadMoreUi();
+          return;
+        }
+        otherFetchInFlight = true;
+        updateLoadMoreUi();
+        otherStatus.textContent = "Loading more posts…";
+        let fetched = [];
+        let hadError = false;
+        try {
+          fetched = await fetchOtherPostsByAuthor(pubkey, {
+            limit: otherFetchLimit,
+            until: otherFetchUntil,
+          });
+        } catch {
+          fetched = [];
+          hadError = true;
         }
         if (seq !== renderSeq) return;
-        renderPostsWithNames(postsBox, posts);
-      })
-      .catch(() => {});
+        const added = mergeOtherPosts(fetched);
+        updateOtherFetchCursor();
+        if (!hadError && (added === 0 || fetched.length === 0)) otherHasMore = false;
+        otherFetchInFlight = false;
+        updateLoadMoreUi();
+        if (hadError) otherStatus.textContent = "Load more failed. Try again.";
+        else otherStatus.textContent = added === 0 ? "No more posts found." : "";
+        applyOtherFilters();
+      };
+
+      const ensureOtherPostsLoaded = async () => {
+        if (otherPostsLoaded || otherPostsLoading) return;
+        otherPostsLoading = true;
+        otherList.innerHTML = "";
+        otherList.append(el("p", { class: "muted", text: "Loading other posts…" }));
+        otherPostsById.clear();
+        otherPosts = [];
+        otherFetchUntil = null;
+        otherHasMore = true;
+        await loadMoreOtherPosts();
+        otherPostsLoaded = true;
+        otherPostsLoading = false;
+        if (seq !== renderSeq) return;
+      };
+
+      searchInput.addEventListener("input", () => {
+        otherSearchQuery = searchInput.value || "";
+        applyOtherFilters();
+      });
+
+      selectBtn.addEventListener("click", () => {
+        otherSelectionMode = !otherSelectionMode;
+        updateSelectionUi();
+        applyOtherFilters();
+      });
+
+      displayBtn.addEventListener("click", async () => {
+        otherStatus.textContent = "";
+        const ids = Array.from(selectedOtherPostIds);
+        otherStatus.textContent = "Saving selection…";
+        await saveSelectedOtherPosts(ids);
+        if (seq !== renderSeq) return;
+        otherStatus.textContent = "Saved.";
+      });
+
+      updateSelectionUi();
+      updateLoadMoreUi();
+      setFilterButtons(otherFilterType);
+      setViewButtons(otherViewMode);
+
+      const setActivePostsTab = (tab) => {
+        const showOther = tab === "other";
+        yoyostrPane.hidden = showOther;
+        otherPane.hidden = !showOther;
+        yoyostrTabBtn?.setAttribute("aria-current", showOther ? "false" : "true");
+        otherTabBtn?.setAttribute("aria-current", showOther ? "true" : "false");
+        if (showOther) ensureOtherPostsLoaded();
+      };
+
+      yoyostrTabBtn?.addEventListener("click", () => setActivePostsTab("yoyostr"));
+      otherTabBtn?.addEventListener("click", () => setActivePostsTab("other"));
+
+      loadMoreBtn.addEventListener("click", () => {
+        loadMoreOtherPosts();
+      });
+
+      if ("IntersectionObserver" in window) {
+        const observer = new IntersectionObserver(
+          (entries) => {
+            const hit = entries.some((entry) => entry.isIntersecting);
+            if (!hit) return;
+            if (seq !== renderSeq) return;
+            if (otherPane.hidden) return;
+            if (!otherHasMore || otherFetchInFlight) return;
+            loadMoreOtherPosts();
+          },
+          { rootMargin: "200px" }
+        );
+        observer.observe(loadMoreSentinel);
+      } else {
+        window.addEventListener("scroll", () => {
+          if (seq !== renderSeq) return;
+          if (otherPane.hidden) return;
+          if (!otherHasMore || otherFetchInFlight) return;
+          const threshold = 200;
+          if (window.innerHeight + window.scrollY >= document.body.offsetHeight - threshold) {
+            loadMoreOtherPosts();
+          }
+        });
+      }
+    }
+    };
+    loadPostsSection();
   };
 
   const renderTrack = async (trackId) => {
@@ -3824,6 +4686,7 @@ async function init() {
               await setActiveAuth({
                 type: "nip46",
                 pubkey: refreshed,
+                remotePubkey: session.remotePubkey || getActiveRemotePubkey(),
                 sessionId: sessionId || session.id,
               });
               updateAuthUi();
