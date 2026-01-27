@@ -1818,8 +1818,28 @@ async function init() {
 
     const buttonRow = el("div", { class: "auth-row" }, [copyBtn, scannedBtn, continueBtn]);
     const pasteRow = el("div", { class: "auth-row" }, [pasteInput, pasteBtn]);
+    const debugCopyBtn = debugBox
+      ? el("button", { type: "button", text: "Copy debug trace" })
+      : null;
+    const debugCopyStatus = debugBox
+      ? el("span", { class: "muted", style: "font-size:12px; margin-left:8px;" })
+      : null;
+    const debugCopyRow = debugBox
+      ? el("div", { class: "auth-row", style: "margin-top:4px;" }, [
+          debugCopyBtn,
+          debugCopyStatus,
+        ])
+      : null;
     if (debugBox) {
-      remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus, debugBox);
+      remotePanel.append(
+        qrBox,
+        connectTextarea,
+        buttonRow,
+        pasteRow,
+        remoteStatus,
+        debugBox,
+        debugCopyRow
+      );
     } else {
       remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus);
     }
@@ -1831,18 +1851,55 @@ async function init() {
     let resolvingAccount = false;
     let lastRemotePubkey = null;
     let needsSignatureConfirm = false;
-    const debugState = { relays: [], lastAction: "", resolvedPubkey: "" };
+    const debugState = {
+      relays: null,
+      baseRelays: null,
+      okRelays: null,
+      failedRelays: null,
+      lastAction: "",
+      resolvedPubkey: "",
+      sessionId: "",
+      clientPubkey: "",
+      remotePubkey: "",
+      lastError: "",
+    };
 
     const setDebugState = (patch = {}) => {
       if (!debugBox) return;
       Object.assign(debugState, patch);
       const lines = ["Debug"];
-      if (debugState.relays?.length) {
-        lines.push(`relays: ${debugState.relays.join(", ")}`);
+      if (Array.isArray(debugState.baseRelays)) {
+        const list = debugState.baseRelays.length ? debugState.baseRelays.join(", ") : "(none)";
+        lines.push(`base relays: ${list}`);
       }
+      if (Array.isArray(debugState.okRelays)) {
+        const list = debugState.okRelays.length ? debugState.okRelays.join(", ") : "(none)";
+        lines.push(`ok relays: ${list}`);
+      }
+      if (Array.isArray(debugState.failedRelays)) {
+        const list = debugState.failedRelays.length ? debugState.failedRelays.join(", ") : "(none)";
+        lines.push(`failed relays: ${list}`);
+      }
+      if (Array.isArray(debugState.relays)) {
+        const list = debugState.relays.length ? debugState.relays.join(", ") : "(none)";
+        lines.push(`final relays: ${list}`);
+      }
+      if (debugState.sessionId) lines.push(`session: ${debugState.sessionId}`);
+      if (debugState.clientPubkey) lines.push(`client pubkey: ${debugState.clientPubkey}`);
+      if (debugState.remotePubkey) lines.push(`remote pubkey: ${debugState.remotePubkey}`);
       if (debugState.lastAction) lines.push(`last action: ${debugState.lastAction}`);
       if (debugState.resolvedPubkey) lines.push(`resolved pubkey: ${debugState.resolvedPubkey}`);
+      if (debugState.lastError) lines.push(`last error: ${debugState.lastError}`);
       debugBox.textContent = lines.join("\n");
+    };
+
+    const logDebug = (message, data) => {
+      if (!debugEnabled) return;
+      try {
+        console.debug("[auth][nip46]", message, data || "");
+      } catch {
+        // ignore
+      }
     };
 
     const setRemoteStatus = (message, isError) => {
@@ -1881,10 +1938,16 @@ async function init() {
       const delayMs = Number.isFinite(options.delayMs) ? options.delayMs : 900;
       for (let i = 0; i < attempts; i++) {
         try {
-          setDebugState({ lastAction: `requested get_public_key (${i + 1}/${attempts})` });
+          setDebugState({
+            lastAction: `requested get_public_key (${i + 1}/${attempts})`,
+            lastError: "",
+          });
+          logDebug("request get_public_key", { attempt: i + 1, timeoutMs });
           const resolved = await nip46RequestPublicKey(sessionRecord, timeoutMs);
           if (resolved) return resolved;
-        } catch {
+        } catch (err) {
+          setDebugState({ lastError: err?.message || "get_public_key failed" });
+          logDebug("get_public_key failed", err);
           // retry
         }
         if (delayMs > 0) {
@@ -1897,7 +1960,8 @@ async function init() {
     const requestSignaturePubkey = async (sessionRecord, timeoutMs = 5000) => {
       try {
         setRemoteStatus("Connected. Approve the signature request to confirm your account...");
-        setDebugState({ lastAction: "requested sign_event probe" });
+        setDebugState({ lastAction: "requested sign_event probe", lastError: "" });
+        logDebug("request sign_event probe", { timeoutMs });
         const now = Math.floor(Date.now() / 1000);
         const probeEvent = {
           kind: 1,
@@ -1909,7 +1973,9 @@ async function init() {
         const signed = await nip46RequestSignEvent(sessionRecord, probeEvent, timeoutMs);
         const pk = typeof signed?.pubkey === "string" ? signed.pubkey : "";
         return pk || null;
-      } catch {
+      } catch (err) {
+        setDebugState({ lastError: err?.message || "sign_event probe failed" });
+        logDebug("sign_event probe failed", err);
         return null;
       }
     };
@@ -1921,6 +1987,11 @@ async function init() {
       const normalizedAccount = normalizeHexPubkey(accountPubkey);
       const normalizedRemote = normalizeHexPubkey(remotePubkey);
       const displayPubkey = normalizedAccount || (allowRemoteFallback ? normalizedRemote : null);
+      logDebug("apply nip46 auth", {
+        accountPubkey: normalizedAccount || null,
+        remotePubkey: normalizedRemote || null,
+        allowRemoteFallback,
+      });
       await setActiveAuth({
         type: "nip46",
         pubkey: normalizedAccount,
@@ -1977,6 +2048,8 @@ async function init() {
       currentSession = sessionRecord;
       lastRemotePubkey = remotePubkey;
       needsSignatureConfirm = false;
+      setDebugState({ remotePubkey: normalizeHexPubkey(remotePubkey) });
+      logDebug("finalize connect", { remotePubkey });
 
       if (resolvingAccount) return;
       resolvingAccount = true;
@@ -1997,6 +2070,8 @@ async function init() {
           pasteBtn.disabled = false;
           showContinueOption(true);
           resolvingAccount = false;
+          setDebugState({ lastAction: "ui timeout fired (waiting on account pubkey)" });
+          logDebug("ui timeout fired", { sessionId: sessionRecord?.id });
         }, 7000);
 
         const resolvedPubkey = await resolveAccountPubkey(sessionRecord, {
@@ -2015,6 +2090,8 @@ async function init() {
           scannedBtn.disabled = false;
           pasteBtn.disabled = false;
           showContinueOption(true);
+          setDebugState({ lastAction: "get_public_key failed; awaiting signature" });
+          logDebug("get_public_key failed; awaiting signature");
           return;
         }
 
@@ -2022,6 +2099,7 @@ async function init() {
           lastAction: "resolved account pubkey",
           resolvedPubkey: normalizeHexPubkey(resolvedPubkey),
         });
+        logDebug("resolved account pubkey", { pubkey: resolvedPubkey });
         scannedBtn.textContent = "I scanned the QR";
         scannedBtn.disabled = false;
         pasteBtn.disabled = false;
@@ -2044,6 +2122,7 @@ async function init() {
       setWaitingState(true);
       setRemoteStatus("Waiting for approval on your phone...");
       setDebugState({ lastAction: "waiting for signer approval" });
+      logDebug("waiting for signer approval", { sessionId: session?.id });
       waitingController = new AbortController();
       try {
         const remotePubkey = await nip46WaitForConnect(
@@ -2051,10 +2130,14 @@ async function init() {
           DEFAULT_TIMEOUT_MS,
           waitingController.signal
         );
+        setDebugState({ remotePubkey: normalizeHexPubkey(remotePubkey) });
+        logDebug("signer approved", { remotePubkey });
         await finalizeRemoteConnect(session, remotePubkey);
       } catch (err) {
         await updateNip46Session(session.id, { status: "failed" });
         setRemoteStatus(`Connect failed: ${err?.message || String(err)}`, true);
+        setDebugState({ lastError: err?.message || "connect failed" });
+        logDebug("connect failed", err);
       } finally {
         setWaitingState(false);
       }
@@ -2067,24 +2150,41 @@ async function init() {
     let relays = baseRelays;
     let okRelays = [];
     let failedRelays = [];
+    setDebugState({ baseRelays, okRelays: [], failedRelays: [] });
+    logDebug("relay base list", { baseRelays });
     try {
       ({ okRelays, failedRelays } = await probeRelays(baseRelays, 1500));
       if (okRelays.length) {
-        const primalOk = okRelays.includes(PRIMAL_RELAY);
-        relays = primalOk ? normalizeRelayList([PRIMAL_RELAY, ...okRelays]) : okRelays;
+        relays = normalizeRelayList([PRIMAL_RELAY, ...okRelays]);
+      } else {
+        relays = baseRelays;
       }
       if (failedRelays.length && okRelays.length) {
         setRemoteStatus(`Some relays were unreachable. Using ${okRelays.length} relay(s) for connect.`);
       } else if (!okRelays.length && baseRelays.length) {
         setRemoteStatus("Relays unreachable; QR connect may fail. Try again or edit relays.", true);
       }
-    } catch {
+      logDebug("relay probe results", { okRelays, failedRelays });
+      setDebugState({ okRelays, failedRelays });
+    } catch (err) {
       relays = baseRelays;
+      setDebugState({ lastError: err?.message || "relay probe failed" });
+      logDebug("relay probe failed", err);
     }
 
     const normalizedRelays = normalizeRelayList(relays);
     setDebugState({ relays: normalizedRelays });
+    logDebug("relay selection final", {
+      baseRelays,
+      okRelays,
+      failedRelays,
+      finalRelays: normalizedRelays,
+    });
     currentSession = await ensurePendingNip46Session(normalizedRelays, "qr");
+    setDebugState({
+      sessionId: currentSession?.id || "",
+      clientPubkey: currentSession?.clientPubkey || "",
+    });
     const currentRelays = Array.isArray(currentSession?.relays) ? currentSession.relays : [];
     const relaysMatch =
       normalizedRelays.length === currentRelays.length &&
@@ -2126,6 +2226,42 @@ async function init() {
       }
     });
 
+    if (debugCopyBtn) {
+      debugCopyBtn.addEventListener("click", async () => {
+        const debugText = debugBox?.textContent || "";
+        const trace = Array.isArray(window?.__YOYOSTR_NIP46_TRACE)
+          ? window.__YOYOSTR_NIP46_TRACE
+          : [];
+        const traceLines = trace.map((entry) => {
+          const t = entry?.t || "";
+          const step = entry?.step || "";
+          let data = "";
+          if (entry && entry.data !== undefined) {
+            try {
+              data = JSON.stringify(entry.data);
+            } catch {
+              data = String(entry.data);
+            }
+          }
+          return [t, step, data].filter(Boolean).join(" ");
+        });
+        const combined = [debugText.trim(), "NIP-46 trace", ...traceLines]
+          .filter(Boolean)
+          .join("\n");
+        try {
+          await navigator.clipboard.writeText(combined);
+          if (debugCopyStatus) debugCopyStatus.textContent = "Copied.";
+        } catch {
+          if (debugCopyStatus) debugCopyStatus.textContent = "Copy failed.";
+        }
+        if (debugCopyStatus) {
+          setTimeout(() => {
+            debugCopyStatus.textContent = "";
+          }, 2000);
+        }
+      });
+    }
+
     scannedBtn.addEventListener("click", async () => {
       if (resolvingAccount) return;
       if (waiting) return;
@@ -2150,6 +2286,7 @@ async function init() {
             lastAction: "resolved account pubkey via signature",
             resolvedPubkey: normalizeHexPubkey(signedPubkey),
           });
+          logDebug("resolved account pubkey via signature", { pubkey: signedPubkey });
           await applyNip46Auth(currentSession, {
             accountPubkey: signedPubkey,
             remotePubkey: currentSession.remotePubkey,
@@ -2169,6 +2306,7 @@ async function init() {
         true
       );
       setDebugState({ lastAction: "continued with signer key" });
+      logDebug("continued with signer key", { remotePubkey: currentSession.remotePubkey });
       showContinueOption(false);
       await applyNip46Auth(currentSession, {
         accountPubkey: null,
