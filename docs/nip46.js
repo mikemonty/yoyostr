@@ -191,8 +191,11 @@ function isProbablyUrl(value) {
   }
 }
 
-function buildResponseFilters(session) {
-  const since = Math.max(0, nowSeconds() - 60);
+function buildResponseFilters(session, options = {}) {
+  const since =
+    typeof options.since === "number" && Number.isFinite(options.since)
+      ? Math.max(0, Math.floor(options.since))
+      : Math.max(0, nowSeconds() - 60);
   return [
     {
       kinds: [REQUEST_KIND],
@@ -246,6 +249,7 @@ async function publishRequest(session, remotePubkey, payload, options = {}) {
   if (!relays.length) throw new Error("Missing relays for NIP-46 session.");
   const payloadJson = JSON.stringify(payload);
   const method = options.method || payload?.method || "";
+  const debugEnabled = isDebugEnabled();
   nip46DebugLog("request built", {
     method,
     payloadLength: payloadJson.length,
@@ -277,6 +281,9 @@ async function publishRequest(session, remotePubkey, payload, options = {}) {
     content,
   };
   const signed = finalizeEvent(unsignedEvent, hexToBytes(session.clientPrivkey));
+  if (debugEnabled) {
+    nip46DebugLog("request event", { summary: formatEventSummary(signed) });
+  }
   nip46DebugLog("request signed", {
     eventId: signed.id,
     kind: signed.kind,
@@ -288,11 +295,23 @@ async function publishRequest(session, remotePubkey, payload, options = {}) {
   });
   const pubs = pool.publish(relays, signed);
   const publishItems = Array.isArray(pubs) ? pubs : [pubs];
-  let publishResults = [];
-  let perRelayLogged = false;
+  const perRelay = new Map();
+  const markRelay = (relayUrl, status, reason) => {
+    if (!relayUrl) return;
+    const existing = perRelay.get(relayUrl) || { relay: relayUrl, status: "unknown" };
+    if (existing.status === "failed" && status !== "failed") return;
+    perRelay.set(relayUrl, {
+      relay: relayUrl,
+      status,
+      reason: reason || existing.reason,
+    });
+  };
+  relays.forEach((relayUrl) => markRelay(relayUrl, "unknown"));
+  const publishResults = [];
+  let handled = false;
   for (const pub of publishItems) {
     if (pub && typeof pub.on === "function") {
-      perRelayLogged = true;
+      handled = true;
       publishResults.push(
         new Promise((resolve) => {
           let settled = false;
@@ -310,18 +329,29 @@ async function publishRequest(session, remotePubkey, payload, options = {}) {
           try {
             pub.on("ok", () => {
               nip46DebugLog("publish ok", { relay: relayUrl, eventId: signed.id });
+              markRelay(relayUrl, "ok");
               done();
             });
             pub.on("failed", (err) => {
-              nip46DebugLog("publish error", {
+              const reason = err?.message || String(err);
+              nip46DebugLog("publish failed", {
                 relay: relayUrl,
                 eventId: signed.id,
-                error: err?.message || String(err),
+                reason,
               });
+              markRelay(relayUrl, "failed", reason);
               done();
+            });
+            pub.on("notice", (notice) => {
+              const reason = String(notice || "");
+              nip46DebugLog("publish notice", { relay: relayUrl, eventId: signed.id, reason });
+              if (reason && !perRelay.get(relayUrl)?.reason) {
+                markRelay(relayUrl, perRelay.get(relayUrl)?.status || "unknown", reason);
+              }
             });
             pub.on("seen", () => {
               nip46DebugLog("publish ok", { relay: relayUrl, eventId: signed.id });
+              markRelay(relayUrl, "ok");
               done();
             });
           } catch {
@@ -331,27 +361,48 @@ async function publishRequest(session, remotePubkey, payload, options = {}) {
       );
     }
   }
-  if (!perRelayLogged) {
-    publishResults = [
-      Promise.allSettled(
-        publishItems.map((item) => (item && typeof item.then === "function" ? item : Promise.resolve(item)))
-      ).then((results) => {
-        const okCount = results.filter((r) => r.status === "fulfilled").length;
-        const errorCount = results.filter((r) => r.status === "rejected").length;
-        nip46DebugLog("publish settled", {
-          eventId: signed.id,
-          relayCount: relays.length,
-          okCount,
-          errorCount,
-        });
-      }),
-    ];
+  if (!handled && debugEnabled) {
+    if (publishItems.some((item) => item && typeof item.then === "function")) {
+      publishResults.push(
+        Promise.allSettled(
+          publishItems.map((item) =>
+            item && typeof item.then === "function" ? item : Promise.resolve(item)
+          )
+        ).then((results) => {
+          nip46DebugLog("publish promises", {
+            eventId: signed.id,
+            settled: results.length,
+          });
+        })
+      );
+    } else {
+      nip46DebugLog("publish unknown return type", {
+        eventId: signed.id,
+        type: typeof pubs,
+        keys: pubs && typeof pubs === "object" ? Object.keys(pubs) : [],
+      });
+    }
   }
+  const waitMs = debugEnabled ? 1500 : 1200;
   // Don't let stalled relay publishes block follow-up response waits.
   await Promise.race([
     Promise.allSettled(publishResults),
-    new Promise((resolve) => setTimeout(resolve, 1200)),
+    new Promise((resolve) => setTimeout(resolve, waitMs)),
   ]);
+  if (debugEnabled) {
+    const perRelayList = Array.from(perRelay.values());
+    const okCount = perRelayList.filter((r) => r.status === "ok").length;
+    const failedCount = perRelayList.filter((r) => r.status === "failed").length;
+    const unknownCount = perRelayList.filter((r) => r.status === "unknown").length;
+    nip46DebugLog("publish settled", {
+      eventId: signed.id,
+      relayCount: relays.length,
+      okCount,
+      failedCount,
+      unknownCount,
+      perRelay: perRelayList,
+    });
+  }
   return signed;
 }
 
@@ -461,16 +512,18 @@ function createResponseWaiter(session, requestId, options = {}) {
     typeof options.timeoutMs === "number" ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
   const signal = options.signal;
   const method = options.method || "";
-  const requestEventId = options.requestEventId || "";
+  let requestEventId = options.requestEventId || "";
   const relays = normalizeRelays(session?.relays);
-  const filters = buildResponseFilters(session);
+  const sinceSkewSeconds = isDebugEnabled() ? 120 : 60;
+  const since = Math.max(0, nowSeconds() - sinceSkewSeconds);
+  const filters = buildResponseFilters(session, { since });
   const startMs = Date.now();
   let eventsSeen = 0;
   let lastError = "";
   let settled = false;
   let openedAuth = false;
   nip46DebugLog("waiter created", { method, requestId });
-  nip46DebugLog("waiter armed", { method, requestId, relays, filters });
+  nip46DebugLog("waiter armed", { method, requestId, relays, filters, since });
 
   let sub;
   const basePromise = new Promise((resolve, reject) => {
@@ -601,7 +654,10 @@ function createResponseWaiter(session, requestId, options = {}) {
   return {
     promise,
     close: () => closeSub(sub),
-    meta: { relays, filters },
+    setRequestEventId: (id) => {
+      requestEventId = id || "";
+    },
+    meta: { relays, filters, since },
   };
 }
 
@@ -1015,8 +1071,16 @@ export async function nip46RequestPublicKey(session, timeoutMs, signal) {
     });
     payload = response.payload;
   } else {
-    const attempt = async (requestId, encryptMode) => {
-      const waiter = createResponseWaiter(session, requestId, {
+    const modes = [undefined, "nip04"];
+    for (let i = 0; i < modes.length; i++) {
+      const mode = modes[i];
+      const attemptId = makeId();
+      nip46DebugLog("attempt start", {
+        method,
+        requestId: attemptId,
+        mode: mode || "auto",
+      });
+      const waiter = createResponseWaiter(session, attemptId, {
         timeoutMs,
         signal,
         method,
@@ -1025,27 +1089,25 @@ export async function nip46RequestPublicKey(session, timeoutMs, signal) {
         const requestEvent = await publishRequest(
           session,
           session.remotePubkey,
-          { id: requestId, method, params: [] },
-          { encryptMode, method }
+          { id: attemptId, method, params: [] },
+          { encryptMode: mode, method }
         );
+        waiter.setRequestEventId(requestEvent?.id || "");
         nip46DebugLog("publish returned", {
           method,
-          requestId,
+          requestId: attemptId,
           requestEventId: requestEvent?.id || "",
         });
         const response = await waiter.promise;
-        return response.payload;
+        payload = response.payload;
+        break;
+      } catch (err) {
+        if (!isTimeoutError(err) || i === modes.length - 1) {
+          throw err;
+        }
       } finally {
         waiter.close();
       }
-    };
-    const firstId = makeId();
-    try {
-      payload = await attempt(firstId);
-    } catch (err) {
-      if (!isTimeoutError(err)) throw err;
-      const retryId = makeId();
-      payload = await attempt(retryId, "nip04");
     }
   }
   const pubkey = typeof payload?.result === "string" ? payload.result : "";
@@ -1073,8 +1135,16 @@ export async function nip46RequestSignEvent(session, event, timeoutMs, signal) {
     });
     payload = response.payload;
   } else {
-    const attempt = async (requestId, encryptMode) => {
-      const waiter = createResponseWaiter(session, requestId, {
+    const modes = [undefined, "nip04"];
+    for (let i = 0; i < modes.length; i++) {
+      const mode = modes[i];
+      const attemptId = makeId();
+      nip46DebugLog("attempt start", {
+        method,
+        requestId: attemptId,
+        mode: mode || "auto",
+      });
+      const waiter = createResponseWaiter(session, attemptId, {
         timeoutMs,
         signal,
         method,
@@ -1083,27 +1153,25 @@ export async function nip46RequestSignEvent(session, event, timeoutMs, signal) {
         const requestEvent = await publishRequest(
           session,
           session.remotePubkey,
-          { id: requestId, method, params },
-          { encryptMode, method }
+          { id: attemptId, method, params },
+          { encryptMode: mode, method }
         );
+        waiter.setRequestEventId(requestEvent?.id || "");
         nip46DebugLog("publish returned", {
           method,
-          requestId,
+          requestId: attemptId,
           requestEventId: requestEvent?.id || "",
         });
         const response = await waiter.promise;
-        return response.payload;
+        payload = response.payload;
+        break;
+      } catch (err) {
+        if (!isTimeoutError(err) || i === modes.length - 1) {
+          throw err;
+        }
       } finally {
         waiter.close();
       }
-    };
-    const firstId = makeId();
-    try {
-      payload = await attempt(firstId);
-    } catch (err) {
-      if (!isTimeoutError(err)) throw err;
-      const retryId = makeId();
-      payload = await attempt(retryId, "nip04");
     }
   }
   const signedRaw = typeof payload?.result === "string" ? payload.result : "";
