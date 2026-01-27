@@ -191,16 +191,42 @@ function isProbablyUrl(value) {
   }
 }
 
-async function encryptPayload(privkeyHex, pubkeyHex, payload) {
+function buildResponseFilters(session) {
+  const since = Math.max(0, nowSeconds() - 60);
+  return [
+    {
+      kinds: [REQUEST_KIND],
+      "#p": [session.clientPubkey],
+      since,
+    },
+  ];
+}
+
+async function encryptPayload(privkeyHex, pubkeyHex, payload, options = {}) {
+  const requestedMode = options?.mode || "auto";
+  if (requestedMode === "nip04") {
+    return { content: await nip04.encrypt(privkeyHex, pubkeyHex, payload), mode: "nip04" };
+  }
+  if (requestedMode === "nip44") {
+    if (nip44?.v2?.utils?.getConversationKey && nip44?.v2?.encrypt) {
+      try {
+        const convKey = nip44.v2.utils.getConversationKey(privkeyHex, pubkeyHex);
+        return { content: await nip44.v2.encrypt(payload, convKey), mode: "nip44" };
+      } catch {
+        // fallback to nip04 below
+      }
+    }
+    return { content: await nip04.encrypt(privkeyHex, pubkeyHex, payload), mode: "nip04" };
+  }
   if (nip44?.v2?.utils?.getConversationKey && nip44?.v2?.encrypt) {
     try {
       const convKey = nip44.v2.utils.getConversationKey(privkeyHex, pubkeyHex);
-      return nip44.v2.encrypt(payload, convKey);
+      return { content: await nip44.v2.encrypt(payload, convKey), mode: "nip44" };
     } catch {
       // fallback to nip04 below
     }
   }
-  return nip04.encrypt(privkeyHex, pubkeyHex, payload);
+  return { content: await nip04.encrypt(privkeyHex, pubkeyHex, payload), mode: "nip04" };
 }
 
 async function decryptPayload(privkeyHex, pubkeyHex, payload) {
@@ -215,22 +241,31 @@ async function decryptPayload(privkeyHex, pubkeyHex, payload) {
   return nip04.decrypt(privkeyHex, pubkeyHex, payload);
 }
 
-async function publishRequest(session, remotePubkey, payload) {
+async function publishRequest(session, remotePubkey, payload, options = {}) {
   const relays = normalizeRelays(session?.relays);
   if (!relays.length) throw new Error("Missing relays for NIP-46 session.");
   const payloadJson = JSON.stringify(payload);
+  const method = options.method || payload?.method || "";
   nip46DebugLog("request built", {
-    method: payload?.method || "",
+    method,
     payloadLength: payloadJson.length,
     remotePubkey,
   });
   let content;
   try {
-    content = await encryptPayload(session.clientPrivkey, remotePubkey, payloadJson);
-    nip46DebugLog("encrypt ok", { method: payload?.method || "", payloadLength: payloadJson.length });
+    const encrypted = await encryptPayload(session.clientPrivkey, remotePubkey, payloadJson, {
+      mode: options.encryptMode,
+    });
+    content = encrypted.content;
+    nip46DebugLog("encrypt mode", {
+      method,
+      mode: encrypted.mode,
+      requestId: payload?.id || "",
+    });
+    nip46DebugLog("encrypt ok", { method, payloadLength: payloadJson.length });
   } catch (err) {
     nip46DebugLog("encrypt error", {
-      method: payload?.method || "",
+      method,
       error: err?.message || String(err),
     });
     throw err;
@@ -248,26 +283,70 @@ async function publishRequest(session, remotePubkey, payload) {
     relayCount: relays.length,
   });
   trackRelayConnections(relays, "publish");
-  const pubs = pool.publish(relays, signed);
-  const publishTasks = Array.isArray(pubs) ? pubs : [pubs];
   relays.forEach((relayUrl) => {
     nip46DebugLog("publish start", { relay: relayUrl, eventId: signed.id });
   });
-  const publishResults = publishTasks.map((pub, idx) =>
-    Promise.resolve(pub)
-      .then(() => {
-        const relayUrl = relays[idx] || relays[0] || "";
-        nip46DebugLog("publish ok", { relay: relayUrl, eventId: signed.id });
-      })
-      .catch((err) => {
-        const relayUrl = relays[idx] || relays[0] || "";
-        nip46DebugLog("publish error", {
-          relay: relayUrl,
+  const pubs = pool.publish(relays, signed);
+  const publishItems = Array.isArray(pubs) ? pubs : [pubs];
+  let publishResults = [];
+  let perRelayLogged = false;
+  for (const pub of publishItems) {
+    if (pub && typeof pub.on === "function") {
+      perRelayLogged = true;
+      publishResults.push(
+        new Promise((resolve) => {
+          let settled = false;
+          const relayUrl =
+            relayLabel(pub?.relay) ||
+            relayLabel(pub?.url) ||
+            relayLabel(pub?.relayUrl) ||
+            relayLabel(pub?.relay_url) ||
+            "";
+          const done = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          try {
+            pub.on("ok", () => {
+              nip46DebugLog("publish ok", { relay: relayUrl, eventId: signed.id });
+              done();
+            });
+            pub.on("failed", (err) => {
+              nip46DebugLog("publish error", {
+                relay: relayUrl,
+                eventId: signed.id,
+                error: err?.message || String(err),
+              });
+              done();
+            });
+            pub.on("seen", () => {
+              nip46DebugLog("publish ok", { relay: relayUrl, eventId: signed.id });
+              done();
+            });
+          } catch {
+            done();
+          }
+        })
+      );
+    }
+  }
+  if (!perRelayLogged) {
+    publishResults = [
+      Promise.allSettled(
+        publishItems.map((item) => (item && typeof item.then === "function" ? item : Promise.resolve(item)))
+      ).then((results) => {
+        const okCount = results.filter((r) => r.status === "fulfilled").length;
+        const errorCount = results.filter((r) => r.status === "rejected").length;
+        nip46DebugLog("publish settled", {
           eventId: signed.id,
-          error: err?.message || String(err),
+          relayCount: relays.length,
+          okCount,
+          errorCount,
         });
-      })
-  );
+      }),
+    ];
+  }
   // Don't let stalled relay publishes block follow-up response waits.
   await Promise.race([
     Promise.allSettled(publishResults),
@@ -276,17 +355,10 @@ async function publishRequest(session, remotePubkey, payload) {
   return signed;
 }
 
-function subscribeForResponses(session, onEvent) {
+function subscribeForResponses(session, onEvent, options = {}) {
   const relays = normalizeRelays(session?.relays);
   if (!relays.length) throw new Error("Missing relays for NIP-46 session.");
-  const since = Math.max(0, nowSeconds() - 60);
-  const filters = [
-    {
-      kinds: [REQUEST_KIND],
-      "#p": [session.clientPubkey],
-      since,
-    },
-  ];
+  const filters = options.filters || buildResponseFilters(session);
   nip46DebugLog("subscribe filters", { filters });
   nip46DebugLog("sub opened", { relays });
   trackRelayConnections(relays, "subscribe");
@@ -378,6 +450,159 @@ function withTimeout(promise, timeoutMs, onTimeout) {
     }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function isTimeoutError(err) {
+  return err?.message === "Request timed out.";
+}
+
+function createResponseWaiter(session, requestId, options = {}) {
+  const timeoutMs =
+    typeof options.timeoutMs === "number" ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
+  const signal = options.signal;
+  const method = options.method || "";
+  const requestEventId = options.requestEventId || "";
+  const relays = normalizeRelays(session?.relays);
+  const filters = buildResponseFilters(session);
+  const startMs = Date.now();
+  let eventsSeen = 0;
+  let lastError = "";
+  let settled = false;
+  let openedAuth = false;
+  nip46DebugLog("waiter created", { method, requestId });
+  nip46DebugLog("waiter armed", { method, requestId, relays, filters });
+
+  let sub;
+  const basePromise = new Promise((resolve, reject) => {
+    sub = subscribeForResponses(
+      session,
+      async (event, relay) => {
+        const relayUrl = relayLabel(relay);
+        eventsSeen += 1;
+        nip46DebugLog("event received", {
+          relay: relayUrl,
+          summary: formatEventSummary(event),
+        });
+        if (settled) {
+          nip46DebugLog("event ignored", { reason: "already settled", relay: relayUrl });
+          return;
+        }
+        if (!event?.content || typeof event.pubkey !== "string") {
+          nip46DebugLog("event ignored", {
+            reason: "missing content/pubkey",
+            relay: relayUrl,
+            summary: formatEventSummary(event),
+          });
+          return;
+        }
+        if (event.kind !== REQUEST_KIND) {
+          nip46DebugLog("event ignored", {
+            reason: "wrong kind",
+            relay: relayUrl,
+            summary: formatEventSummary(event),
+          });
+          return;
+        }
+        const fromPubkey = normalizeHex(event.pubkey);
+        let decrypted;
+        try {
+          decrypted = await decryptPayload(session.clientPrivkey, fromPubkey, event.content);
+        } catch (err) {
+          lastError = err?.message || String(err);
+          nip46DebugLog("decrypt error", { relay: relayUrl, error: lastError });
+          return;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(decrypted);
+        } catch (err) {
+          lastError = err?.message || String(err);
+          nip46DebugLog("parse error", { relay: relayUrl, error: lastError });
+          return;
+        }
+        if (!payload || typeof payload !== "object") {
+          nip46DebugLog("event ignored", { reason: "missing payload", relay: relayUrl });
+          return;
+        }
+        if (requestId && payload.id !== requestId) {
+          nip46DebugLog("event ignored", {
+            reason: "request id mismatch",
+            relay: relayUrl,
+            expected: requestId,
+            received: payload.id,
+          });
+          return;
+        }
+
+        if (payload.result === "auth_url" && isProbablyUrl(payload.error) && !openedAuth) {
+          openedAuth = true;
+          nip46DebugLog("auth url", { relay: relayUrl });
+          try {
+            window.open(payload.error, "_blank", "noopener,noreferrer");
+          } catch {
+            // ignore
+          }
+          return;
+        }
+
+        nip46DebugLog("response parsed", {
+          relay: relayUrl,
+          resultType: typeof payload?.result,
+          hasError: Boolean(payload?.error),
+        });
+
+        if (payload.error) {
+          settled = true;
+          lastError = String(payload.error);
+          nip46DebugLog("response error", { relay: relayUrl, error: lastError });
+          closeSub(sub);
+          reject(new Error(String(payload.error)));
+          return;
+        }
+
+        settled = true;
+        closeSub(sub);
+        nip46DebugLog("waiter resolved", { method, requestId, relay: relayUrl });
+        resolve({ payload, event });
+      },
+      { filters }
+    );
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      closeSub(sub);
+      reject(new Error("Request aborted."));
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+
+  const promise = withTimeout(basePromise, timeoutMs, () => {
+    if (settled) return;
+    nip46DebugLog("waiter timeout", {
+      method,
+      requestId,
+      requestEventId,
+      elapsedMs: Date.now() - startMs,
+      relays,
+      eventsSeen,
+      lastError: lastError || null,
+    });
+    closeSub(sub);
+  });
+
+  return {
+    promise,
+    close: () => closeSub(sub),
+    meta: { relays, filters },
+  };
 }
 
 async function waitForResponse(session, requestId, options = {}) {
@@ -740,12 +965,30 @@ export async function nip46ConnectWithBunker(session, remotePubkey, secret, perm
   if (secret) params.push(secret);
   if (perms || DEFAULT_PERMS) params.push(perms || DEFAULT_PERMS);
   const id = makeId();
-  const requestEvent = await publishRequest(session, rp, { id, method: "connect", params });
-  const { payload } = await waitForResponse(session, id, {
-    signal,
-    method: "connect",
-    requestEventId: requestEvent?.id || "",
-  });
+  let payload;
+  if (!isDebugEnabled()) {
+    const requestEvent = await publishRequest(session, rp, { id, method: "connect", params });
+    const response = await waitForResponse(session, id, {
+      signal,
+      method: "connect",
+      requestEventId: requestEvent?.id || "",
+    });
+    payload = response.payload;
+  } else {
+    const waiter = createResponseWaiter(session, id, { signal, method: "connect" });
+    try {
+      const requestEvent = await publishRequest(session, rp, { id, method: "connect", params });
+      nip46DebugLog("publish returned", {
+        method: "connect",
+        requestId: id,
+        requestEventId: requestEvent?.id || "",
+      });
+      const response = await waiter.promise;
+      payload = response.payload;
+    } finally {
+      waiter.close();
+    }
+  }
   const result = typeof payload?.result === "string" ? payload.result : "";
   if (secret && result !== secret && result !== "ack") {
     throw new Error("Remote signer rejected the connection.");
@@ -755,18 +998,56 @@ export async function nip46ConnectWithBunker(session, remotePubkey, secret, perm
 
 export async function nip46RequestPublicKey(session, timeoutMs, signal) {
   if (!session?.remotePubkey) throw new Error("Missing remote pubkey.");
-  const id = makeId();
-  const requestEvent = await publishRequest(session, session.remotePubkey, {
-    id,
-    method: "get_public_key",
-    params: [],
-  });
-  const { payload } = await waitForResponse(session, id, {
-    timeoutMs,
-    signal,
-    method: "get_public_key",
-    requestEventId: requestEvent?.id || "",
-  });
+  const method = "get_public_key";
+  let payload;
+  if (!isDebugEnabled()) {
+    const id = makeId();
+    const requestEvent = await publishRequest(session, session.remotePubkey, {
+      id,
+      method,
+      params: [],
+    });
+    const response = await waitForResponse(session, id, {
+      timeoutMs,
+      signal,
+      method,
+      requestEventId: requestEvent?.id || "",
+    });
+    payload = response.payload;
+  } else {
+    const attempt = async (requestId, encryptMode) => {
+      const waiter = createResponseWaiter(session, requestId, {
+        timeoutMs,
+        signal,
+        method,
+      });
+      try {
+        const requestEvent = await publishRequest(
+          session,
+          session.remotePubkey,
+          { id: requestId, method, params: [] },
+          { encryptMode, method }
+        );
+        nip46DebugLog("publish returned", {
+          method,
+          requestId,
+          requestEventId: requestEvent?.id || "",
+        });
+        const response = await waiter.promise;
+        return response.payload;
+      } finally {
+        waiter.close();
+      }
+    };
+    const firstId = makeId();
+    try {
+      payload = await attempt(firstId);
+    } catch (err) {
+      if (!isTimeoutError(err)) throw err;
+      const retryId = makeId();
+      payload = await attempt(retryId, "nip04");
+    }
+  }
   const pubkey = typeof payload?.result === "string" ? payload.result : "";
   if (!pubkey) throw new Error("Missing public key from signer.");
   return normalizeHex(pubkey);
@@ -774,19 +1055,57 @@ export async function nip46RequestPublicKey(session, timeoutMs, signal) {
 
 export async function nip46RequestSignEvent(session, event, timeoutMs, signal) {
   if (!session?.remotePubkey) throw new Error("Missing remote pubkey.");
-  const id = makeId();
+  const method = "sign_event";
   const params = [JSON.stringify(event)];
-  const requestEvent = await publishRequest(session, session.remotePubkey, {
-    id,
-    method: "sign_event",
-    params,
-  });
-  const { payload } = await waitForResponse(session, id, {
-    timeoutMs,
-    signal,
-    method: "sign_event",
-    requestEventId: requestEvent?.id || "",
-  });
+  let payload;
+  if (!isDebugEnabled()) {
+    const id = makeId();
+    const requestEvent = await publishRequest(session, session.remotePubkey, {
+      id,
+      method,
+      params,
+    });
+    const response = await waitForResponse(session, id, {
+      timeoutMs,
+      signal,
+      method,
+      requestEventId: requestEvent?.id || "",
+    });
+    payload = response.payload;
+  } else {
+    const attempt = async (requestId, encryptMode) => {
+      const waiter = createResponseWaiter(session, requestId, {
+        timeoutMs,
+        signal,
+        method,
+      });
+      try {
+        const requestEvent = await publishRequest(
+          session,
+          session.remotePubkey,
+          { id: requestId, method, params },
+          { encryptMode, method }
+        );
+        nip46DebugLog("publish returned", {
+          method,
+          requestId,
+          requestEventId: requestEvent?.id || "",
+        });
+        const response = await waiter.promise;
+        return response.payload;
+      } finally {
+        waiter.close();
+      }
+    };
+    const firstId = makeId();
+    try {
+      payload = await attempt(firstId);
+    } catch (err) {
+      if (!isTimeoutError(err)) throw err;
+      const retryId = makeId();
+      payload = await attempt(retryId, "nip04");
+    }
+  }
   const signedRaw = typeof payload?.result === "string" ? payload.result : "";
   if (!signedRaw) throw new Error("Missing signed event.");
   let signed;
