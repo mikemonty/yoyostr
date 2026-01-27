@@ -30,8 +30,16 @@ export function getActiveAuthType() {
   return cachedSettings?.activeAuthType ?? null;
 }
 
-export function getActivePubkey() {
+export function getActiveRemotePubkey() {
+  return cachedSettings?.activeRemotePubkey ?? null;
+}
+
+export function getActiveAccountPubkey() {
   return cachedSettings?.activePubkey ?? null;
+}
+
+export function getActivePubkey() {
+  return cachedSettings?.activePubkey ?? cachedSettings?.activeRemotePubkey ?? null;
 }
 
 export function getActiveNip46SessionId() {
@@ -45,7 +53,9 @@ export function hasNip07Extension() {
 export function canSign() {
   const type = getActiveAuthType();
   if (type === "nip07") return isNip07Available();
-  if (type === "nip46") return Boolean(getActivePubkey() && getActiveNip46SessionId());
+  if (type === "nip46") {
+    return Boolean((getActiveRemotePubkey() || getActivePubkey()) && getActiveNip46SessionId());
+  }
   return false;
 }
 
@@ -55,18 +65,23 @@ export async function connectWithNip07() {
   cachedSettings = await updateSettings({
     activeAuthType: "nip07",
     activePubkey: pubkey,
+    activeRemotePubkey: null,
     activeNip46SessionId: null,
   });
   return pubkey;
 }
 
-export async function setActiveAuth({ type, pubkey, sessionId }) {
+export async function setActiveAuth({ type, pubkey, remotePubkey, sessionId }) {
   await ensureAuthReady();
-  cachedSettings = await updateSettings({
+  const patch = {
     activeAuthType: type || null,
     activePubkey: pubkey || null,
     activeNip46SessionId: sessionId || null,
-  });
+  };
+  if (typeof remotePubkey !== "undefined") {
+    patch.activeRemotePubkey = remotePubkey || null;
+  }
+  cachedSettings = await updateSettings(patch);
   return cachedSettings;
 }
 
@@ -75,6 +90,7 @@ export async function clearActiveAuth() {
   cachedSettings = await updateSettings({
     activeAuthType: null,
     activePubkey: null,
+    activeRemotePubkey: null,
     activeNip46SessionId: null,
   });
   return cachedSettings;
@@ -121,10 +137,16 @@ export async function refreshNip46Pubkey(timeoutMs = 5000) {
   const session = await getNip46Session(sessionId);
   if (!session || session.status !== "connected" || !session.remotePubkey) return null;
   const pubkey = await nip46RequestPublicKey(session, timeoutMs);
-  if (pubkey && normalizeHex(pubkey) !== normalizeHex(cachedSettings?.activePubkey)) {
+  const nextRemote = session.remotePubkey || cachedSettings?.activeRemotePubkey || null;
+  const pubkeyChanged =
+    pubkey && normalizeHex(pubkey) !== normalizeHex(cachedSettings?.activePubkey);
+  const remoteChanged =
+    nextRemote && normalizeHex(nextRemote) !== normalizeHex(cachedSettings?.activeRemotePubkey);
+  if (pubkeyChanged || remoteChanged) {
     cachedSettings = await updateSettings({
       activeAuthType: "nip46",
-      activePubkey: pubkey,
+      activePubkey: pubkey || cachedSettings?.activePubkey || null,
+      activeRemotePubkey: nextRemote,
       activeNip46SessionId: sessionId,
     });
   }

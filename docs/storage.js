@@ -31,6 +31,7 @@ export async function ensureDefaultSettings() {
       relays: normalizeRelays(RELAYS),
       activeAuthType: null,
       activePubkey: null,
+      activeRemotePubkey: null,
       activeNip46SessionId: null,
     };
     await db.settings.put(settings);
@@ -38,8 +39,14 @@ export async function ensureDefaultSettings() {
   }
 
   const relays = normalizeRelays(settings.relays || RELAYS);
-  if (!Array.isArray(settings.relays) || relays.length !== settings.relays.length) {
-    settings = { ...settings, relays };
+  const needsRelaysFix = !Array.isArray(settings.relays) || relays.length !== settings.relays.length;
+  const needsRemoteKey = !Object.prototype.hasOwnProperty.call(settings, "activeRemotePubkey");
+  if (needsRelaysFix || needsRemoteKey) {
+    settings = {
+      ...settings,
+      relays,
+      activeRemotePubkey: needsRemoteKey ? null : settings.activeRemotePubkey,
+    };
     await db.settings.put(settings);
   }
   return settings;
@@ -61,6 +68,7 @@ export async function updateSettings(patch) {
     relays: normalizeRelays(RELAYS),
     activeAuthType: null,
     activePubkey: null,
+    activeRemotePubkey: null,
     activeNip46SessionId: null,
   };
   const next = { ...current, ...patch, id: DEFAULT_SETTINGS_ID };
@@ -103,4 +111,3 @@ export async function updateNip46Session(id, patch) {
   await db.nip46_sessions.put(next);
   return next;
 }
-
