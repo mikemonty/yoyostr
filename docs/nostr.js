@@ -1,4 +1,5 @@
 import { APP_TAG, KIND_BADGE_PREFS, KIND_TRACK, KIND_UNIT, RELAYS } from "./config.js";
+import { getActivePubkey, signEvent } from "./auth.js";
 
 const BAD_RELAYS_STORAGE_KEY = "yoyostr_bad_relays_v1";
 const RELAY_FAIL_TTL_MS = 10 * 60 * 1000;
@@ -697,11 +698,7 @@ export async function publishBadgeDefinition({
   unitAddress,
   relays,
 } = {}) {
-  if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-    throw new Error("Missing signer (NIP-07).");
-  }
-
-  const pubkey = normalizeHexPubkey(await window.nostr.getPublicKey?.());
+  const pubkey = normalizeHexPubkey(getActivePubkey());
   if (!pubkey) throw new Error("Missing signer pubkey.");
 
   const uref = typeof unitRef === "string" ? unitRef.trim() : "";
@@ -736,7 +733,7 @@ export async function publishBadgeDefinition({
     pubkey,
   };
 
-  const signedEvent = await window.nostr.signEvent(unsignedEvent);
+  const signedEvent = await signEvent(unsignedEvent);
   const results = await publishEventToRelays(relays || RELAYS, signedEvent);
   return { signedEvent, results };
 }
@@ -899,11 +896,7 @@ export async function publishBadgeAward({
   unitRef,
   relays,
 } = {}) {
-  if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-    throw new Error("Missing signer (NIP-07).");
-  }
-
-  const pubkey = normalizeHexPubkey(await window.nostr.getPublicKey?.());
+  const pubkey = normalizeHexPubkey(getActivePubkey());
   if (!pubkey) throw new Error("Missing signer pubkey.");
 
   const recipient = normalizeHexPubkey(recipientPubkeyHex);
@@ -940,7 +933,7 @@ export async function publishBadgeAward({
     pubkey,
   };
 
-  const signedEvent = await window.nostr.signEvent(unsignedEvent);
+  const signedEvent = await signEvent(unsignedEvent);
   const results = await publishEventToRelays(relays || RELAYS, signedEvent);
   return { signedEvent, results };
 }
@@ -1026,11 +1019,7 @@ function safeParseJsonObject(raw) {
 }
 
 export async function publishBadgePrefs({ hidden, relays } = {}) {
-  if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-    throw new Error("Missing signer (NIP-07).");
-  }
-
-  const pubkey = normalizeHexPubkey(await window.nostr.getPublicKey?.());
+  const pubkey = normalizeHexPubkey(getActivePubkey());
   if (!pubkey) throw new Error("Missing signer pubkey.");
 
   const hiddenList = Array.isArray(hidden)
@@ -1050,7 +1039,7 @@ export async function publishBadgePrefs({ hidden, relays } = {}) {
     pubkey,
   };
 
-  const signedEvent = await window.nostr.signEvent(unsignedEvent);
+  const signedEvent = await signEvent(unsignedEvent);
   const results = await publishEventToRelays(relays || RELAYS, signedEvent);
   return { signedEvent, results };
 }

@@ -32,7 +32,36 @@ import {
   publishEventToRelays,
 } from "./nostr.js";
 import { getEmbedInfo } from "./embed.js";
-import { clearStoredPubkey, getStoredPubkey, signInWithNip07 } from "./auth.js";
+import {
+  initAuth,
+  getActiveAuthType,
+  getActivePubkey,
+  connectWithNip07,
+  clearActiveAuth,
+  canSign,
+  hasNip07Extension,
+  setActiveAuth,
+  getSettings,
+  ensurePendingNip46Session,
+  getNip46SessionByClientPubkey,
+  getNip46Session,
+  getActiveNip46SessionId,
+  putNip46Session,
+  updateNip46Session,
+  signEvent,
+} from "./auth.js";
+import {
+  createNip46Session,
+  buildNostrConnectUri,
+  parseConnectString,
+  nip46WaitForConnect,
+  nip46ConnectWithBunker,
+  nip46RequestPublicKey,
+  DEFAULT_TIMEOUT_MS,
+  DEFAULT_PERMS,
+} from "./nip46.js";
+import * as QRCode from "https://esm.sh/qrcode@1.5.3";
+import { nip19 } from "https://esm.sh/nostr-tools@2.7.2";
 
 const ASSERTION_THRESHOLD = 3;
 
@@ -98,6 +127,16 @@ function renderTracks(container, tracks) {
 
 function normalizeHexPubkey(pubkey) {
   return typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+}
+
+function toNpub(pubkeyHex) {
+  const pk = normalizeHexPubkey(pubkeyHex);
+  if (!pk) return "";
+  try {
+    return nip19.npubEncode(pk);
+  } catch {
+    return pk;
+  }
 }
 
 function shortHex(value) {
@@ -321,8 +360,16 @@ function ensureAppShell(appRoot) {
 function parseRoute(hash) {
   const h = typeof hash === "string" ? hash : "";
   const cleaned = h.startsWith("#") ? h.slice(1) : h;
-  const path = cleaned.startsWith("/") ? cleaned : cleaned ? `/${cleaned}` : "/";
+  const qIndex = cleaned.indexOf("?");
+  const pathPart = qIndex >= 0 ? cleaned.slice(0, qIndex) : cleaned;
+  const queryPart = qIndex >= 0 ? cleaned.slice(qIndex + 1) : "";
+  const path = pathPart.startsWith("/") ? pathPart : pathPart ? `/${pathPart}` : "/";
+  const query = new URLSearchParams(queryPart);
 
+  if (/^\/auth\/?$/.test(path)) {
+    const returnTo = query.get("returnTo") || query.get("r") || "";
+    return { name: "auth", returnTo };
+  }
   if (/^\/learn\/?$/.test(path)) return { name: "learn" };
   if (/^\/community\/?$/.test(path)) return { name: "community" };
   if (/^\/badges\/?$/.test(path)) return { name: "badges" };
@@ -945,6 +992,7 @@ async function init() {
   const adminBtn = document.getElementById("adminBtn");
   const signInBtn = document.getElementById("signInBtn");
   const signOutBtn = document.getElementById("signOutBtn");
+  const activeSignerLabel = document.getElementById("activeSignerLabel");
   let statusEl = document.getElementById("status");
   const navHome = document.getElementById("navHome");
   const navLearn = document.getElementById("navLearn");
@@ -964,7 +1012,8 @@ async function init() {
   app.textContent = "Loading…";
 
   try {
-    let signedInPubkey = normalizeHexPubkey(getStoredPubkey()) || null;
+    await initAuth();
+    let signedInPubkey = normalizeHexPubkey(getActivePubkey()) || null;
     let isMaintainer = false;
     let adminUi = null;
     let proofUi = null;
@@ -1020,16 +1069,25 @@ async function init() {
 
   const updateAuthUi = () => {
     const isSignedIn = Boolean(signedInPubkey);
-    const hasGetPublicKey = Boolean(window.nostr && typeof window.nostr.getPublicKey === "function");
-    const hasSignEvent = Boolean(window.nostr && typeof window.nostr.signEvent === "function");
-    const isCached = isSignedIn && !hasGetPublicKey;
+    const authType = getActiveAuthType();
+    const canSignNow = canSign();
+    const hasNip07 = hasNip07Extension();
     isMaintainer = normalizeHexPubkey(signedInPubkey) === normalizeHexPubkey(MAINTAINER_PUBKEY_HEX);
 
     if (adminBtn) adminBtn.hidden = !isMaintainer;
-    if (adminBtn) adminBtn.disabled = !hasSignEvent;
-    if (signInBtn) signInBtn.textContent = isSignedIn ? (isCached ? "Signed in (cached)" : "Signed in") : "Sign in";
+    if (adminBtn) adminBtn.disabled = !canSignNow;
+    if (signInBtn) signInBtn.textContent = isSignedIn ? "Signer settings" : "Connect signer";
     if (signInBtn) signInBtn.disabled = false;
     if (signOutBtn) signOutBtn.hidden = !isSignedIn;
+    if (activeSignerLabel) {
+      if (!isSignedIn) {
+        activeSignerLabel.textContent = "";
+      } else {
+        const labelType =
+          authType === "nip46" ? "Remote signer" : hasNip07 ? "Extension" : "Signer";
+        activeSignerLabel.textContent = `Connected as ${toNpub(signedInPubkey)} (${labelType})`;
+      }
+    }
   };
 
   updateAuthUi();
@@ -1047,35 +1105,16 @@ async function init() {
     await renderRoute();
   };
 
-  const signIn = async () => {
-    if (!window.nostr || typeof window.nostr.getPublicKey !== "function") {
-      setStatus(statusEl, "Install/enable a Nostr signer (Alby) to sign in.", { error: true });
-      return;
-    }
-
-    setStatus(statusEl, "Signing in…");
-    try {
-      signedInPubkey = await signInWithNip07();
-    } catch (err) {
-      setStatus(statusEl, `Sign-in failed: ${err?.message || String(err)}`, { error: true });
-      updateAuthUi();
-      return;
-    }
-
-    const wasMaintainer = isMaintainer;
-    isMaintainer = normalizeHexPubkey(signedInPubkey) === normalizeHexPubkey(MAINTAINER_PUBKEY_HEX);
-    setStatus(
-      statusEl,
-      isMaintainer ? "Signed in as maintainer." : "Signed in (not maintainer)."
-    );
-    updateAuthUi();
-    if (wasMaintainer !== isMaintainer) renderRoute();
+  const signIn = () => {
+    const currentHash = window.location.hash || "#/";
+    const returnTo = currentHash.startsWith("#/auth") ? "#/" : currentHash;
+    window.location.hash = `#/auth?returnTo=${encodeURIComponent(returnTo)}`;
   };
 
-  const signOut = () => {
+  const signOut = async () => {
+    await clearActiveAuth();
     signedInPubkey = null;
     isMaintainer = false;
-    clearStoredPubkey();
     if (adminBtn) adminBtn.hidden = true;
     setStatus(statusEl, "Signed out.");
     updateAuthUi();
@@ -1466,11 +1505,11 @@ async function init() {
         proofUi.status.textContent = "";
 
         if (!signedInPubkey) {
-          proofUi.status.textContent = "Sign in to post.";
+          proofUi.status.textContent = "Connect a signer to post.";
           return;
         }
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          proofUi.status.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+        if (!canSign()) {
+          proofUi.status.textContent = "Signer unavailable. Check your connection or extension.";
           return;
         }
 
@@ -1514,7 +1553,7 @@ async function init() {
 
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           proofUi.status.textContent = `Sign failed: ${err?.message || String(err)}`;
           proofUi.publishBtn.disabled = false;
@@ -1556,6 +1595,280 @@ async function init() {
     renderTracks(list, tracks);
     app.append(list);
     app.append(el("p", { class: "muted", text: "Next: Units + proofs + badges." }));
+  };
+
+  const renderAuth = async (returnTo) => {
+    setPageTitle(["Connect signer"]);
+    app.innerHTML = "";
+
+    const backHref =
+      typeof returnTo === "string" && returnTo.startsWith("#") ? returnTo : "#/";
+    app.append(el("div", { class: "crumbs" }, [el("a", { href: backHref, text: "← Back" })]));
+    app.append(el("h2", { text: "Connect signer", style: "margin: 10px 0 14px;" }));
+
+    const grid = el("div", { class: "auth-grid" });
+    app.append(grid);
+
+    const extPanel = el("section", { class: "auth-panel" });
+    extPanel.append(el("h3", { text: "Extension (NIP-07)", style: "margin:0;" }));
+    extPanel.append(
+      el("p", {
+        class: "muted",
+        text: "Use a browser extension signer (Alby, nos2x, etc.) to connect.",
+      })
+    );
+    const extStatus = el("div", { class: "muted" });
+    const extBtn = el("button", { type: "button", text: "Connect extension" });
+    extBtn.disabled = !hasNip07Extension();
+    extBtn.addEventListener("click", async () => {
+      extStatus.textContent = "";
+      extBtn.disabled = true;
+      try {
+        const pubkey = await connectWithNip07();
+        signedInPubkey = normalizeHexPubkey(pubkey);
+        updateAuthUi();
+        setStatus(statusEl, "Connected via extension.");
+        if (window.location.hash === backHref) {
+          await renderRoute();
+        } else {
+          window.location.hash = backHref;
+        }
+      } catch (err) {
+        extStatus.textContent = `Connect failed: ${err?.message || String(err)}`;
+        extBtn.disabled = !hasNip07Extension();
+      }
+    });
+    extPanel.append(extBtn, extStatus);
+    grid.append(extPanel);
+
+    const remotePanel = el("section", { class: "auth-panel" });
+    remotePanel.append(el("h3", { text: "Remote signer (NIP-46)", style: "margin:0;" }));
+    remotePanel.append(
+      el("p", {
+        class: "muted",
+        text: "Scan with a mobile signer (Primal, etc.) or paste a nostrconnect:// or bunker:// string.",
+      })
+    );
+
+    const remoteStatus = el("div", { class: "muted" });
+    const qrBox = el("div", { class: "auth-qr" }, [
+      el("span", { class: "muted", text: "Loading QR…" }),
+    ]);
+    const connectTextarea = el("textarea", {
+      rows: "3",
+      readonly: "true",
+      class: "mono",
+      spellcheck: "false",
+    });
+    const copyBtn = el("button", { type: "button", text: "Copy" });
+    const scannedBtn = el("button", { type: "button", text: "I scanned the QR" });
+
+    const pasteInput = el("input", {
+      type: "text",
+      placeholder: "Paste nostrconnect:// or bunker://",
+      class: "mono",
+    });
+    const pasteBtn = el("button", { type: "button", text: "Connect" });
+
+    const buttonRow = el("div", { class: "auth-row" }, [copyBtn, scannedBtn]);
+    const pasteRow = el("div", { class: "auth-row" }, [pasteInput, pasteBtn]);
+    remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus);
+    grid.append(remotePanel);
+
+    let waiting = false;
+    let currentSession = null;
+    let waitingController = null;
+
+    const setRemoteStatus = (message, isError) => {
+      remoteStatus.textContent = message || "";
+      remoteStatus.style.color = isError ? "var(--status-error-color, #b00020)" : "";
+    };
+
+    const setWaitingState = (isWaiting) => {
+      waiting = isWaiting;
+      scannedBtn.disabled = isWaiting;
+      pasteBtn.disabled = isWaiting;
+      copyBtn.disabled = !connectTextarea.value;
+      if (!isWaiting && waitingController) {
+        waitingController.abort();
+        waitingController = null;
+      }
+    };
+
+    const finalizeRemoteConnect = async (session, remotePubkey) => {
+      const updatedAt = new Date().toISOString();
+      let sessionRecord = await updateNip46Session(session.id, {
+        status: "connected",
+        remotePubkey,
+      });
+      if (!sessionRecord) {
+        sessionRecord = {
+          ...session,
+          remotePubkey,
+          status: "connected",
+          updatedAt,
+        };
+        await putNip46Session(sessionRecord);
+      }
+
+      await setActiveAuth({
+        type: "nip46",
+        pubkey: remotePubkey,
+        sessionId: session.id,
+      });
+      signedInPubkey = normalizeHexPubkey(remotePubkey);
+      updateAuthUi();
+      setStatus(statusEl, "Connected via remote signer.");
+      if (window.location.hash === backHref) {
+        await renderRoute();
+      } else {
+        window.location.hash = backHref;
+      }
+
+      // Resolve the account pubkey in the background so the UI can update without blocking login.
+      (async () => {
+        try {
+          const resolved = await nip46RequestPublicKey(sessionRecord, 5000);
+          if (!resolved) return;
+          if (normalizeHexPubkey(resolved) === normalizeHexPubkey(signedInPubkey)) return;
+          await setActiveAuth({
+            type: "nip46",
+            pubkey: resolved,
+            sessionId: sessionRecord.id,
+          });
+          signedInPubkey = normalizeHexPubkey(resolved);
+          updateAuthUi();
+          if (window.location.hash === backHref) {
+            await renderRoute();
+          }
+        } catch {
+          // ignore if the signer doesn't respond to get_public_key quickly
+        }
+      })();
+    };
+
+    const startWaiting = async (session) => {
+      if (!session) return;
+      setWaitingState(true);
+      setRemoteStatus("Waiting for approval on your phone…");
+      waitingController = new AbortController();
+      try {
+        const remotePubkey = await nip46WaitForConnect(
+          session,
+          DEFAULT_TIMEOUT_MS,
+          waitingController.signal
+        );
+        await finalizeRemoteConnect(session, remotePubkey);
+      } catch (err) {
+        await updateNip46Session(session.id, { status: "failed" });
+        setRemoteStatus(`Connect failed: ${err?.message || String(err)}`, true);
+        setWaitingState(false);
+      }
+    };
+
+    const settings = await getSettings();
+    const relays = Array.isArray(settings?.relays) && settings.relays.length ? settings.relays : RELAYS;
+    currentSession = await ensurePendingNip46Session(relays, "qr");
+    if (!currentSession.relays?.length && relays.length) {
+      currentSession = await updateNip46Session(currentSession.id, { relays });
+    }
+
+    const connectString = buildNostrConnectUri(currentSession, {
+      name: "YoYoStr",
+      url: window.location.origin,
+      perms: DEFAULT_PERMS,
+    });
+    connectTextarea.value = connectString;
+    copyBtn.disabled = !connectString;
+    try {
+      const qrDataUrl = await QRCode.toDataURL(connectString, { margin: 1, width: 240 });
+      qrBox.innerHTML = "";
+      qrBox.append(
+        el("img", {
+          src: qrDataUrl,
+          alt: "Nostr Connect QR",
+          style: "width:100%; height:100%; object-fit:contain;",
+        })
+      );
+    } catch (err) {
+      qrBox.innerHTML = "";
+      qrBox.append(el("span", { class: "muted", text: "QR failed to render." }));
+    }
+
+    copyBtn.addEventListener("click", async () => {
+      if (!connectTextarea.value) return;
+      try {
+        await navigator.clipboard.writeText(connectTextarea.value);
+        setRemoteStatus("Copied.");
+      } catch {
+        connectTextarea.focus();
+        connectTextarea.select();
+      }
+    });
+
+    scannedBtn.addEventListener("click", async () => {
+      if (waiting) return;
+      await startWaiting(currentSession);
+    });
+
+    pasteBtn.addEventListener("click", async () => {
+      if (waiting) return;
+      const raw = String(pasteInput.value || "").trim();
+      if (!raw) {
+        setRemoteStatus("Paste a nostrconnect:// or bunker:// string to continue.", true);
+        return;
+      }
+      const parsed = parseConnectString(raw);
+      if (!parsed) {
+        setRemoteStatus("Invalid connect string.", true);
+        return;
+      }
+
+      if (parsed.scheme === "nostrconnect") {
+        const match = await getNip46SessionByClientPubkey(parsed.pubkey);
+        if (!match || match.status !== "pending") {
+          setRemoteStatus("This nostrconnect string does not match a local session.", true);
+          return;
+        }
+        await startWaiting(match);
+        return;
+      }
+
+      if (parsed.scheme === "bunker") {
+        const bunkerSession = createNip46Session(
+          parsed.relays?.length ? parsed.relays : relays,
+          "bunker"
+        );
+        bunkerSession.remotePubkey = parsed.pubkey;
+        if (parsed.secret) bunkerSession.secret = parsed.secret;
+        await putNip46Session(bunkerSession);
+        setWaitingState(true);
+        waitingController = new AbortController();
+        setRemoteStatus("Waiting for bunker approval…");
+        try {
+          await nip46ConnectWithBunker(
+            bunkerSession,
+            parsed.pubkey,
+            parsed.secret,
+            parsed.perms,
+            waitingController.signal
+          );
+          await finalizeRemoteConnect(bunkerSession, parsed.pubkey);
+        } catch (err) {
+          await updateNip46Session(bunkerSession.id, { status: "failed" });
+          setRemoteStatus(`Connect failed: ${err?.message || String(err)}`, true);
+          setWaitingState(false);
+        }
+        return;
+      }
+    });
+
+    // Auto-start waiting so approval on the signer completes without extra clicks.
+    if (!waiting && currentSession?.status === "pending") {
+      setTimeout(() => {
+        if (!waiting) startWaiting(currentSession);
+      }, 200);
+    }
   };
 
   const renderLanding = () => {
@@ -1750,8 +2063,8 @@ async function init() {
 
       publishBtn.addEventListener("click", async () => {
         composerStatus.textContent = "";
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          composerStatus.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+        if (!canSign()) {
+          composerStatus.textContent = "Signer unavailable. Connect a signer.";
           return;
         }
 
@@ -1814,7 +2127,7 @@ async function init() {
 
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           composerStatus.textContent = `Sign failed: ${err?.message || String(err)}`;
           publishBtn.disabled = false;
@@ -2019,8 +2332,8 @@ async function init() {
             (a) => normalizeHexPubkey(a?.pubkey) && normalizeHexPubkey(a.pubkey) === me
           );
           if (already) return { ok: false, reason: "You already verified this proof." };
-          if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-            return { ok: false, reason: "Missing signer: Install/enable a Nostr signer (Alby)." };
+          if (!canSign()) {
+            return { ok: false, reason: "Signer unavailable. Connect a signer." };
           }
           return { ok: true, reason: "" };
         };
@@ -2037,8 +2350,8 @@ async function init() {
             awardStatus.textContent = "Threshold met. Sign in to award the badge.";
             return;
           }
-          if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-            awardStatus.textContent = "Threshold met. Missing signer (NIP-07) to award.";
+          if (!canSign()) {
+            awardStatus.textContent = "Threshold met. Signer unavailable to award.";
             return;
           }
 
@@ -2167,7 +2480,7 @@ async function init() {
               content: "Verified.",
               pubkey: me,
             };
-            const signedEvent = await window.nostr.signEvent(unsignedEvent);
+            const signedEvent = await signEvent(unsignedEvent);
             const results = await publishEventToRelays(RELAYS, signedEvent);
             logRelayResults("assertion publish results", results);
             const ok = Object.values(results).some((r) => r?.ok);
@@ -2544,8 +2857,8 @@ async function init() {
 
       saveBtn.addEventListener("click", async () => {
         saveStatus.textContent = "";
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          saveStatus.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+        if (!canSign()) {
+          saveStatus.textContent = "Signer unavailable. Connect a signer.";
           return;
         }
         if (!signedInPubkey) {
@@ -2585,7 +2898,7 @@ async function init() {
 
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           saveStatus.textContent = `Sign failed: ${err?.message || String(err)}`;
           saveBtn.disabled = false;
@@ -2716,8 +3029,8 @@ async function init() {
 
       saveBtn.addEventListener("click", async () => {
         saveStatus.textContent = "";
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          saveStatus.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+        if (!canSign()) {
+          saveStatus.textContent = "Signer unavailable. Connect a signer.";
           return;
         }
 
@@ -2843,7 +3156,7 @@ async function init() {
         // ignore
       }
       if (!isOwnProfile) return;
-      if (!window.nostr || typeof window.nostr.signEvent !== "function") return;
+      if (!canSign()) return;
 
       const now = Math.floor(Date.now() / 1000);
       const unsignedEvent = {
@@ -2855,7 +3168,7 @@ async function init() {
       };
       let signedEvent;
       try {
-        signedEvent = await window.nostr.signEvent(unsignedEvent);
+        signedEvent = await signEvent(unsignedEvent);
       } catch (err) {
         setStatus(statusEl, `Pin sign failed: ${err?.message || String(err)}`, { error: true });
         return;
@@ -3116,8 +3429,7 @@ async function init() {
     const renderBadgeBox = () => {
       badgeBox.innerHTML = "";
 
-      const canCreate =
-        Boolean(signedInPubkey) && Boolean(window.nostr && typeof window.nostr.signEvent === "function");
+      const canCreate = Boolean(signedInPubkey) && canSign();
 
       if (!Array.isArray(badgeDefs) || badgeDefs.length === 0) {
         badgeBox.append(el("p", { class: "muted", text: "No badges yet." }));
@@ -3169,7 +3481,7 @@ async function init() {
       }
 
       if (!canCreate) {
-        badgeBox.append(el("p", { class: "muted", text: "Sign in to create or edit badges." }));
+        badgeBox.append(el("p", { class: "muted", text: "Connect a signer to create or edit badges." }));
         return;
       }
 
@@ -3225,8 +3537,8 @@ async function init() {
 
       publishBtn.addEventListener("click", async () => {
         status.textContent = "";
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          status.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+        if (!canSign()) {
+          status.textContent = "Signer unavailable. Connect a signer.";
           return;
         }
         const n = String(name.value || "").trim();
@@ -3371,8 +3683,8 @@ async function init() {
 
           approveBtn.addEventListener("click", async () => {
             status.textContent = "";
-            if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-              status.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+            if (!canSign()) {
+              status.textContent = "Signer unavailable. Connect a signer.";
               return;
             }
 
@@ -3409,8 +3721,8 @@ async function init() {
 
           denyBtn.addEventListener("click", async () => {
             status.textContent = "";
-            if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-              status.textContent = "Missing signer: Install/enable a Nostr signer (Alby).";
+            if (!canSign()) {
+              status.textContent = "Signer unavailable. Connect a signer.";
               return;
             }
 
@@ -3437,7 +3749,7 @@ async function init() {
                 content,
                 pubkey: normalizeHexPubkey(signedInPubkey),
               };
-              const signedEvent = await window.nostr.signEvent(unsignedEvent);
+              const signedEvent = await signEvent(unsignedEvent);
               const results = await publishEventToRelays(RELAYS, signedEvent);
               logRelayResults("denial publish results", results);
               const ok = Object.values(results).some((r) => r?.ok);
@@ -3480,10 +3792,11 @@ async function init() {
       .catch(() => {});
   };
 
-    const renderRouteUnsafe = async () => {
-      updateAuthUi();
-      const route = parseRoute(window.location.hash);
-      updateNavUi(route);
+  const renderRouteUnsafe = async () => {
+    updateAuthUi();
+    const route = parseRoute(window.location.hash);
+    updateNavUi(route);
+    if (route.name === "auth") return await renderAuth(route.returnTo);
     if (route.name === "track") return await renderTrack(route.trackId);
     if (route.name === "unit") return await renderUnit(route.trackId, route.unitId);
     if (route.name === "home") return renderLanding();
@@ -3500,6 +3813,26 @@ async function init() {
         setPageTitle(["Profile"]);
         return;
       }
+      if (getActiveAuthType() === "nip46") {
+        try {
+          const sessionId = getActiveNip46SessionId();
+          const session = await getNip46Session(sessionId);
+          if (session && session.status === "connected" && session.remotePubkey) {
+            const refreshed = await nip46RequestPublicKey(session, 5000);
+            if (refreshed && normalizeHexPubkey(refreshed) !== normalizeHexPubkey(signedInPubkey)) {
+              signedInPubkey = normalizeHexPubkey(refreshed);
+              await setActiveAuth({
+                type: "nip46",
+                pubkey: refreshed,
+                sessionId: sessionId || session.id,
+              });
+              updateAuthUi();
+            }
+          }
+        } catch {
+          // ignore refresh failures
+        }
+      }
       return await renderProfile(signedInPubkey, { isSelf: true });
     }
     if (route.name === "profile_view") return await renderProfile(route.pubkeyHex, { isSelf: false });
@@ -3514,13 +3847,13 @@ async function init() {
     renderLanding();
   };
 
-    const renderRoute = async () => {
-      try {
-        return await renderRouteUnsafe();
-      } catch (err) {
-        showVisibleError(err, { title: "Render error", statusEl, appEl: app });
-      }
-    };
+  const renderRoute = async () => {
+    try {
+      return await renderRouteUnsafe();
+    } catch (err) {
+      showVisibleError(err, { title: "Render error", statusEl, appEl: app });
+    }
+  };
 
   async function openAdminWithDefaults(options = {}) {
     if (!adminUi) adminUi = createAdminDialog();
@@ -3583,8 +3916,8 @@ async function init() {
         populateTrackMgmt(trackId);
       });
       adminUi.trackMgmt.publishBtn.addEventListener("click", async () => {
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          appendLog(adminUi.log, "Missing signer: Install/enable a Nostr signer (Alby).");
+        if (!canSign()) {
+          appendLog(adminUi.log, "Signer unavailable. Connect a signer.");
           return;
         }
         if (!signedInPubkey) {
@@ -3635,7 +3968,7 @@ async function init() {
         appendLog(adminUi.log, `Signing track:${trackId} (update)…`);
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           appendLog(adminUi.log, `Sign failed: ${err?.message || String(err)}`);
           return;
@@ -3711,8 +4044,8 @@ async function init() {
       adminUi.editUnit.addVideoBtn.addEventListener("click", () => addEditUnitVideoRow({}));
 
       adminUi.editUnit.publishBtn.addEventListener("click", async () => {
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          appendLog(adminUi.log, "Missing signer: Install/enable a Nostr signer (Alby).");
+        if (!canSign()) {
+          appendLog(adminUi.log, "Signer unavailable. Connect a signer.");
           return;
         }
         if (!signedInPubkey) {
@@ -3773,7 +4106,7 @@ async function init() {
         appendLog(adminUi.log, `Signing unit:${trackId}:${unitId} (update)…`);
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           appendLog(adminUi.log, `Sign failed: ${err?.message || String(err)}`);
           return;
@@ -3798,8 +4131,8 @@ async function init() {
       });
 
       adminUi.createUnit.publishBtn.addEventListener("click", async () => {
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          appendLog(adminUi.log, "Missing signer: Install/enable a Nostr signer (Alby).");
+        if (!canSign()) {
+          appendLog(adminUi.log, "Signer unavailable. Connect a signer.");
           return;
         }
         if (!signedInPubkey) {
@@ -3862,7 +4195,7 @@ async function init() {
         appendLog(adminUi.log, `Signing unit:${trackId}:${unitId}…`);
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           appendLog(adminUi.log, `Sign failed: ${err?.message || String(err)}`);
           return;
@@ -3890,8 +4223,8 @@ async function init() {
       });
 
       adminUi.addVideo.publishBtn.addEventListener("click", async () => {
-        if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-          appendLog(adminUi.log, "Missing signer: Install/enable a Nostr signer (Alby).");
+        if (!canSign()) {
+          appendLog(adminUi.log, "Signer unavailable. Connect a signer.");
           return;
         }
         if (!signedInPubkey) {
@@ -3941,7 +4274,7 @@ async function init() {
         appendLog(adminUi.log, `Signing unit:${trackId}:${unitId} (add video)…`);
         let signedEvent;
         try {
-          signedEvent = await window.nostr.signEvent(unsignedEvent);
+          signedEvent = await signEvent(unsignedEvent);
         } catch (err) {
           appendLog(adminUi.log, `Sign failed: ${err?.message || String(err)}`);
           return;
@@ -4041,8 +4374,8 @@ async function init() {
 
   const overwriteAllTracksFromFallback = async () => {
     if (!adminUi) return;
-    if (!window.nostr || typeof window.nostr.signEvent !== "function") {
-      appendLog(adminUi.log, "Missing signer: Install/enable a Nostr signer (Alby).");
+    if (!canSign()) {
+      appendLog(adminUi.log, "Signer unavailable. Connect a signer.");
       return;
     }
     if (!signedInPubkey) {
@@ -4085,7 +4418,7 @@ async function init() {
       appendLog(adminUi.log, `Signing track:${String(trackId)}…`);
       let signedEvent;
       try {
-        signedEvent = await window.nostr.signEvent(unsignedEvent);
+        signedEvent = await signEvent(unsignedEvent);
       } catch (err) {
         appendLog(adminUi.log, `Sign failed for track:${String(trackId)}: ${err?.message || String(err)}`);
         continue;
@@ -4124,12 +4457,12 @@ async function init() {
     if (signOutBtn) signOutBtn.addEventListener("click", signOut);
     if (adminBtn) adminBtn.addEventListener("click", () => openAdmin({}));
     window.addEventListener("hashchange", renderRoute);
-  window.addEventListener("focus", () => updateAuthUi());
+    window.addEventListener("focus", () => updateAuthUi());
 
-  updateAuthUi();
-  if (!window.location.hash) window.location.hash = "#/";
-  await renderRoute();
-  loadTracks();
+    updateAuthUi();
+    if (!window.location.hash) window.location.hash = "#/";
+    await renderRoute();
+    loadTracks();
   } catch (err) {
     showVisibleError(err, { title: "Boot error", statusEl, appEl: app });
   }

@@ -101,6 +101,11 @@
       .profile-banner { width: 100%; aspect-ratio: 4 / 6; max-height: 520px; object-fit: cover; border-radius: 14px; background: rgba(127,127,127,.08); border: 1px solid rgba(127,127,127,.25); }
       .profile-pic { width: 56px; height: 56px; border-radius: 999px; object-fit: cover; background: rgba(127,127,127,.08); border: 1px solid rgba(127,127,127,.25); }
       dialog { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; backdrop-filter: blur(12px); }
+      .auth-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+      .auth-panel { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; display:grid; gap: 10px; backdrop-filter: blur(10px); }
+      .auth-qr { width: 240px; height: 240px; border-radius: 12px; border: 1px solid var(--panel-border); background: rgba(127,127,127,.08); display:flex; align-items:center; justify-content:center; }
+      .auth-row { display:flex; gap: 10px; align-items:center; flex-wrap: wrap; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
 
       button, input, textarea, select {
         font: inherit;
@@ -141,7 +146,8 @@
             </nav>
           </div>
           <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <button id="signInBtn">Sign in</button>
+            <span id="activeSignerLabel" class="muted" style="font-size: 12px;"></span>
+            <button id="signInBtn">Connect signer</button>
             <button id="signOutBtn" hidden>Sign out</button>
             <button id="adminBtn" hidden>Admin</button>
           </div>
