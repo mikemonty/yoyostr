@@ -49,7 +49,7 @@
       header h1 { color: var(--header-text); letter-spacing: -0.02em; }
       header > div { min-width: 0; }
       #app { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 24px 0 40px; }
-      .track-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; backdrop-filter: blur(10px); }
+      .track-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; backdrop-filter: blur(10px); margin-bottom: 12px; }
       .track-card h3 { margin: 0 0 6px; }
       .track-card p { margin: 0 0 10px; opacity: .85; }
       .track-links { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -209,7 +209,7 @@
           </div>
           <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap;">
             <span id="activeSignerLabel" class="muted" style="font-size: 12px;"></span>
-            <button id="signInBtn">Connect signer</button>
+            <button id="signInBtn">Login</button>
             <button id="signOutBtn" hidden>Sign out</button>
             <button id="adminBtn" hidden>Admin</button>
           </div>

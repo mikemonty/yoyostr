@@ -1595,7 +1595,7 @@ async function init() {
 
     if (adminBtn) adminBtn.hidden = !isMaintainer;
     if (adminBtn) adminBtn.disabled = !canSignNow;
-    if (signInBtn) signInBtn.textContent = isSignedIn ? "Signer settings" : "Connect signer";
+    if (signInBtn) signInBtn.textContent = isSignedIn ? "Signer settings" : "Login";
     if (signInBtn) signInBtn.disabled = false;
     if (signOutBtn) signOutBtn.hidden = !isSignedIn;
     if (activeSignerLabel) {
@@ -1631,10 +1631,23 @@ async function init() {
     await renderRoute();
   };
 
-  const signIn = () => {
-    const currentHash = window.location.hash || "#/";
+  const getAuthHref = (hash = "") => {
+    const currentHash =
+      typeof hash === "string" && hash.trim() ? hash.trim() : window.location.hash || "#/";
     const returnTo = currentHash.startsWith("#/auth") ? "#/" : currentHash;
-    window.location.hash = `#/auth?returnTo=${encodeURIComponent(returnTo)}`;
+    return `#/auth?returnTo=${encodeURIComponent(returnTo)}`;
+  };
+
+  const setAuthLink = (target, text, { prefix = "", suffix = "" } = {}) => {
+    if (!target) return;
+    target.innerHTML = "";
+    if (prefix) target.append(document.createTextNode(prefix));
+    target.append(el("a", { href: getAuthHref(), text }));
+    if (suffix) target.append(document.createTextNode(suffix));
+  };
+
+  const signIn = () => {
+    window.location.hash = getAuthHref();
   };
 
   const signOut = async () => {
@@ -2136,13 +2149,13 @@ async function init() {
   // 3) Simulate relay failures by removing all but a dead relay; verify UI times out and offers Continue/Retry.
   // 4) Verify "Continue anyway" loads app and later switches to correct account pubkey if resolved.
   const renderAuth = async (returnTo) => {
-    setPageTitle(["Connect signer"]);
+    setPageTitle(["Login"]);
     app.innerHTML = "";
 
     const backHref =
       typeof returnTo === "string" && returnTo.startsWith("#") ? returnTo : "#/";
     app.append(el("div", { class: "crumbs" }, [el("a", { href: backHref, text: "← Back" })]));
-    app.append(el("h2", { text: "Connect signer", style: "margin: 10px 0 14px;" }));
+    app.append(el("h2", { text: "Login", style: "margin: 10px 0 14px;" }));
 
     const grid = el("div", { class: "auth-grid" });
     app.append(grid);
@@ -3139,7 +3152,8 @@ async function init() {
         renderCommunity();
       });
     } else {
-      app.append(el("p", { class: "muted", text: "Sign in to post." }));
+      const loginLink = el("a", { href: getAuthHref(), text: "Login to post." });
+      app.append(el("p", { class: "muted" }, [loginLink]));
     }
 
     const feedBox = el("div", {}, [el("p", { class: "muted", text: "Loading posts…" })]);
@@ -3313,7 +3327,7 @@ async function init() {
 
         const canVerify = () => {
           const me = normalizeHexPubkey(signedInPubkey);
-          if (!me) return { ok: false, reason: "Sign in to verify." };
+          if (!me) return { ok: false, reason: "Login to verify.", needsAuth: true };
           if (!recipientPubkey) return { ok: false, reason: "Missing proof author." };
           if (me === recipientPubkey) return { ok: false, reason: "You can’t verify your own proof." };
           const already = (lastAssertions || []).some(
@@ -3335,7 +3349,7 @@ async function init() {
 
           const me = normalizeHexPubkey(signedInPubkey);
           if (!me) {
-            awardStatus.textContent = "Threshold met. Sign in to award the badge.";
+            setAuthLink(awardStatus, "Login to award the badge.", { prefix: "Threshold met. " });
             return;
           }
           if (!canSign()) {
@@ -3441,7 +3455,8 @@ async function init() {
           verifyStatus.textContent = "";
           const status = canVerify();
           if (!status.ok) {
-            verifyStatus.textContent = status.reason || "Cannot verify.";
+            if (status.needsAuth) setAuthLink(verifyStatus, status.reason || "Login to verify.");
+            else verifyStatus.textContent = status.reason || "Cannot verify.";
             return;
           }
 
@@ -3811,7 +3826,7 @@ async function init() {
       profileBox.append(el("p", { class: "muted", style: "margin: 8px 0 0; white-space: pre-wrap;" }, [document.createTextNode(aboutText)]));
     }
 
-    const isOwnProfile = normalizeHexPubkey(signedInPubkey) === pubkey;
+    const isOwnProfile = isSelf || normalizeHexPubkey(signedInPubkey) === pubkey;
     if (isOwnProfile) {
       const box = el("div", { class: "composer", style: "margin-top: 12px;" });
 
@@ -4007,12 +4022,11 @@ async function init() {
         return { checkboxByAddr };
       };
 
-      const isOwnProfileForBadges = normalizeHexPubkey(signedInPubkey) === pubkey;
-      const { checkboxByAddr } = renderBadgeCards(isOwnProfileForBadges ? earnedBadges : visibleBadges, {
-        editable: isOwnProfileForBadges,
+      const { checkboxByAddr } = renderBadgeCards(isOwnProfile ? earnedBadges : visibleBadges, {
+        editable: isOwnProfile,
       });
 
-      if (isOwnProfileForBadges) {
+      if (isOwnProfile) {
         const saveRow = el("div", { style: "margin-top: 10px; display:flex; gap: 10px; align-items: center; flex-wrap: wrap;" });
         const saveBtn = el("button", { type: "button", text: "Save badge display settings" });
         const saveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
@@ -4944,7 +4958,9 @@ async function init() {
 
       unitActions.append(editUnitBtn, addVideoBtn);
     }
-    if (!signedInPubkey) unitActions.append(el("span", { class: "muted", text: "Sign in to post." }));
+    if (!signedInPubkey) {
+      unitActions.append(el("a", { class: "muted", href: getAuthHref(), text: "Login to post." }));
+    }
     app.append(unitActions);
 
     const unitRef = `unit:${trackId}:${unitId}`;
@@ -5351,13 +5367,16 @@ async function init() {
       if (!signedInPubkey) {
         app.innerHTML = "";
         app.append(el("h2", { text: "Your Profile", style: "margin: 0 0 12px;" }));
-        app.append(el("p", { class: "muted", text: "Sign in to view your profile." }));
+        app.append(
+          el("p", { class: "muted" }, [el("a", { href: getAuthHref(), text: "Login to view your profile." })])
+        );
         setPageTitle(["Profile"]);
         return;
       }
       const remotePubkey = normalizeHexPubkey(getActiveRemotePubkey());
       const accountPubkey = normalizeHexPubkey(getActiveAccountPubkey());
-      const effectiveAccountPubkey = accountPubkey && accountPubkey !== remotePubkey ? accountPubkey : "";
+      const effectiveAccountPubkey =
+        accountPubkey || remotePubkey || normalizeHexPubkey(signedInPubkey);
       if (getActiveAuthType() === "nip46") {
         try {
           const sessionId = getActiveNip46SessionId();
