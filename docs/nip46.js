@@ -1127,14 +1127,15 @@ export async function nip46WaitForConnect(session, timeoutMs, signal) {
             return;
           }
 
-          const result = typeof payload.result === "string" ? payload.result : "";
-          if (session.secret && result !== session.secret) {
-            nip46DebugLog("event ignored", {
-              reason: "secret mismatch",
-              relay: relayUrl,
-            });
-            return;
-          }
+        const result = typeof payload.result === "string" ? payload.result : "";
+        if (session.secret && result !== session.secret) {
+          nip46DebugLog("event ignored", {
+            reason: "secret mismatch",
+            relay: relayUrl,
+            resultHint: result === "ack" ? "ack" : "other",
+          });
+          return;
+        }
           if (!session.secret && result !== "ack" && !result) {
             nip46DebugLog("event ignored", {
               reason: "unexpected connect result",
@@ -1143,10 +1144,15 @@ export async function nip46WaitForConnect(session, timeoutMs, signal) {
             return;
           }
 
-          settled = true;
-          closeSub(sub);
-          resolve(fromPubkey);
+        settled = true;
+        closeSub(sub);
+        nip46DebugLog("wait_for_connect resolved", {
+          remotePubkey: fromPubkey,
+          hasSecret: Boolean(session.secret),
+          resultHint: result === "ack" ? "ack" : "secret",
         });
+        resolve(fromPubkey);
+      });
 
         const onAbort = () => {
           if (settled) return;
@@ -1256,6 +1262,7 @@ export async function nip46RequestPublicKey(session, timeoutMs, signal) {
   if (!session?.remotePubkey) throw new Error("Missing remote pubkey.");
   const method = "get_public_key";
   const resolvedTimeoutMs = resolveTimeoutMs(timeoutMs);
+  const autoTimeoutMs = Math.min(resolvedTimeoutMs, isDebugEnabled() ? 15000 : 8000);
   let lastRequestId = "";
   let lastRequestEventId = "";
   try {
@@ -1291,8 +1298,9 @@ export async function nip46RequestPublicKey(session, timeoutMs, signal) {
             requestId: attemptId,
             mode: mode || "auto",
           });
+          const attemptTimeoutMs = mode ? resolvedTimeoutMs : autoTimeoutMs;
           const waiter = createResponseWaiter(session, attemptId, {
-            timeoutMs: resolvedTimeoutMs,
+            timeoutMs: attemptTimeoutMs,
             signal,
             method,
             remotePubkey: session.remotePubkey,

@@ -1080,6 +1080,27 @@ export async function fetchPostById(eventId, options = {}) {
   return match;
 }
 
+// Fetch multiple kind-1 events by id in a single relay query.
+export async function fetchPostsByIds(eventIds, options = {}) {
+  const raw = Array.isArray(eventIds) ? eventIds : [];
+  const ids = [];
+  const seen = new Set();
+  for (const id of raw) {
+    const clean = typeof id === "string" ? id.trim() : "";
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    ids.push(clean);
+  }
+  if (ids.length === 0) return [];
+
+  const limit = toNumberOrNull(options.limit) ?? ids.length;
+  const filter = { ids: ids.slice(0, limit), limit };
+  const events = await fetchEventsFromRelays(filter, options);
+  const posts = events.filter((ev) => toNumberOrNull(ev?.kind) === 1);
+  posts.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+  return posts;
+}
+
 export async function fetchProfile(pubkeyHex, options = {}) {
   const pubkey = normalizeHexPubkey(pubkeyHex);
   if (!pubkey) return null;
@@ -1172,9 +1193,31 @@ export async function fetchYoyostrPostsByAuthor(pubkeyHex, options = {}) {
 
   const limit = toNumberOrNull(options.limit) ?? 50;
   const filter = { kinds: [1], authors: [pubkey], "#t": [APP_TAG], limit };
+  const since = toNumberOrNull(options.since);
+  const until = toNumberOrNull(options.until);
+  if (since !== null) filter.since = since;
+  if (until !== null) filter.until = until;
   const events = await fetchEventsFromRelays(filter, options);
   events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
   return events.slice(0, limit);
+}
+
+// Fetch kind-1 posts by author that are not tagged with the YoYoStr app tag.
+export async function fetchOtherPostsByAuthor(pubkeyHex, options = {}) {
+  const pubkey = normalizeHexPubkey(pubkeyHex);
+  if (!pubkey) return [];
+
+  const limit = toNumberOrNull(options.limit) ?? 50;
+  const filter = { kinds: [1], authors: [pubkey], limit };
+  const since = toNumberOrNull(options.since);
+  const until = toNumberOrNull(options.until);
+  if (since !== null) filter.since = since;
+  if (until !== null) filter.until = until;
+
+  const events = await fetchEventsFromRelays(filter, options);
+  const filtered = events.filter((ev) => !hasTagValue(ev?.tags, "t", APP_TAG));
+  filtered.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+  return filtered.slice(0, limit);
 }
 
 export async function fetchProofsForUnit(unitRef, options = {}) {
