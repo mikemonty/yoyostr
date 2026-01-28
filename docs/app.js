@@ -208,7 +208,8 @@ async function sharePost(event, statusEl) {
     return;
   }
   const url = getPostPermalink(eventId);
-  const content = typeof event?.content === "string" ? event.content.trim() : "";
+  const displayEvent = getContentEvent(event) || event;
+  const content = typeof displayEvent?.content === "string" ? displayEvent.content.trim() : "";
   const text = content ? content.slice(0, 140) : "YoYoStr post";
 
   if (navigator?.share) {
@@ -235,15 +236,57 @@ async function sharePost(event, statusEl) {
 }
 
 async function rebroadcastPost(event, statusEl) {
-  const eventId = typeof event?.id === "string" ? event.id : "";
-  const sig = typeof event?.sig === "string" ? event.sig : "";
-  if (!eventId || !sig) {
+  const originalId = typeof event?.id === "string" ? event.id : "";
+  const originalPubkey = typeof event?.pubkey === "string" ? event.pubkey : "";
+  const originalKind = Number.isFinite(Number(event?.kind)) ? Number(event.kind) : 1;
+  if (!originalId || !originalPubkey) {
     announcePostStatus(statusEl, "Cannot rebroadcast this post.", { error: true });
     return;
   }
-  announcePostStatus(statusEl, "Rebroadcasting…");
+  if (!canSign()) {
+    announcePostStatus(statusEl, "Connect a signer to rebroadcast.", { error: true });
+    return;
+  }
+  const pubkey = normalizeHexPubkey(getActivePubkey());
+  if (!pubkey) {
+    announcePostStatus(statusEl, "Signer unavailable. Connect a signer.", { error: true });
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const tags = [
+    ["e", originalId],
+    ["p", originalPubkey],
+    ["t", APP_TAG],
+    ["k", String(originalKind)],
+  ];
+  let content = "";
   try {
-    const results = await publishEventToRelays(RELAYS, event);
+    content = JSON.stringify(event);
+  } catch {
+    content = "";
+  }
+  const unsignedEvent = {
+    kind: 6,
+    created_at: now,
+    tags,
+    content,
+    pubkey,
+  };
+
+  announcePostStatus(statusEl, "Waiting for signer approval…");
+  let signedEvent;
+  try {
+    signedEvent = await signEvent(unsignedEvent);
+  } catch (err) {
+    announcePostStatus(statusEl, `Rebroadcast failed: ${err?.message || String(err)}`, { error: true });
+    return;
+  }
+
+  try {
+    announcePostStatus(statusEl, "Rebroadcasting…");
+    const relays = getRelays();
+    const results = await publishEventToRelays(relays, signedEvent);
     const okRelays = [];
     const failedRelays = [];
     for (const [relay, result] of Object.entries(results || {})) {
@@ -252,21 +295,6 @@ async function rebroadcastPost(event, statusEl) {
     }
     if (okRelays.length === 0) {
       announcePostStatus(statusEl, "Rebroadcast failed (no relays reported OK).", { error: true });
-      return;
-    }
-    const primalResult = results?.[PRIMAL_RELAY];
-    const primalOk = Boolean(primalResult?.ok);
-    if (!primalOk) {
-      const reason = primalResult?.timeout
-        ? "timeout"
-        : typeof primalResult?.message === "string" && primalResult.message
-          ? primalResult.message
-          : "no OK response";
-      announcePostStatus(
-        statusEl,
-        `Rebroadcasted to ${okRelays.length} relay(s), but Primal relay did not respond OK (${reason}).`,
-        { error: true }
-      );
       return;
     }
     const suffix = failedRelays.length ? ` (${failedRelays.length} relay(s) failed.)` : "";
@@ -309,6 +337,35 @@ function getPostTypeFromTags(tags) {
   return null;
 }
 
+function isRepostEvent(event) {
+  const kind = Number(event?.kind);
+  return kind === 6 || kind === 16;
+}
+
+function parseRepostTargetEvent(event) {
+  if (!isRepostEvent(event)) return null;
+  const raw = typeof event?.content === "string" ? event.content.trim() : "";
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (typeof parsed.id !== "string" && typeof parsed.content !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function getRepostTargetId(event) {
+  const ids = getTagValues(event?.tags, "e");
+  return ids[0] || "";
+}
+
+function getContentEvent(event) {
+  if (isRepostEvent(event)) return parseRepostTargetEvent(event);
+  return event;
+}
+
 function parseUnitRef(unitRef) {
   const raw = typeof unitRef === "string" ? unitRef.trim() : "";
   const m = raw.match(/^unit:([^:]+):([^:]+)$/);
@@ -336,9 +393,11 @@ function makeUniqueBadgeD({ unitRef, name, existingDSet }) {
 }
 
 function getEmbeddableUrlForEvent(event) {
+  const base = getContentEvent(event);
+  if (!base) return null;
   const urls = [];
-  urls.push(...getTagValues(event?.tags, "r"));
-  urls.push(...extractUrlsFromText(event?.content));
+  urls.push(...getTagValues(base?.tags, "r"));
+  urls.push(...extractUrlsFromText(base?.content));
   for (const url of urls) {
     const info = getEmbedInfo(url);
     if (info?.isEmbeddable && info?.embedUrl) return { url, info };
@@ -348,17 +407,21 @@ function getEmbeddableUrlForEvent(event) {
 
 // Returns a best-effort title for a kind-1 event for search matching.
 function getEventTitle(event) {
-  const direct = typeof event?.title === "string" ? event.title.trim() : "";
+  const base = getContentEvent(event);
+  if (!base) return "";
+  const direct = typeof base?.title === "string" ? base.title.trim() : "";
   if (direct) return direct;
-  const tagged = getTagValues(event?.tags, "title")[0] || getTagValues(event?.tags, "subject")[0] || "";
+  const tagged = getTagValues(base?.tags, "title")[0] || getTagValues(base?.tags, "subject")[0] || "";
   return typeof tagged === "string" ? tagged.trim() : "";
 }
 
 // Detects image URLs in content or "r" tags.
 function isImageEvent(event) {
+  const base = getContentEvent(event);
+  if (!base) return false;
   const urls = [];
-  urls.push(...getTagValues(event?.tags, "r"));
-  urls.push(...extractUrlsFromText(event?.content));
+  urls.push(...getTagValues(base?.tags, "r"));
+  urls.push(...extractUrlsFromText(base?.content));
   for (const raw of urls) {
     const url = typeof raw === "string" ? raw.trim() : "";
     if (!url) continue;
@@ -447,6 +510,17 @@ function relaysMatch(a, b) {
   return left.every((value, idx) => value === right[idx]);
 }
 
+let appRelays = normalizeRelayList(RELAYS);
+
+function getRelays() {
+  return appRelays.length ? appRelays : normalizeRelayList(RELAYS);
+}
+
+function setRelays(relays) {
+  appRelays = normalizeRelayList(relays);
+  return appRelays;
+}
+
 // Classifies an event as video, image, or text based on embed/image detection.
 function getContentTypeForEvent(event) {
   if (getEmbeddableUrlForEvent(event)) return "video";
@@ -456,8 +530,10 @@ function getContentTypeForEvent(event) {
 
 // Builds a lowercase search string for filtering.
 function getSearchTextForEvent(event) {
-  const content = typeof event?.content === "string" ? event.content : "";
-  const title = getEventTitle(event);
+  const base = getContentEvent(event);
+  if (!base) return "";
+  const content = typeof base?.content === "string" ? base.content : "";
+  const title = getEventTitle(base);
   return `${title} ${content}`.toLowerCase();
 }
 
@@ -1035,7 +1111,7 @@ function appendLog(textarea, line) {
 async function loadTracksNostrFirst() {
   let tracks = [];
   try {
-    tracks = await fetchTracksFromRelays();
+    tracks = await fetchTracksFromRelays({ relays: getRelays() });
   } catch {
     // Graceful fallback handled below.
   }
@@ -1052,7 +1128,7 @@ async function loadTracksNostrFirst() {
 
 async function loadUnitsNostr(trackId) {
   try {
-    return await fetchUnitsFromRelays(trackId);
+    return await fetchUnitsFromRelays(trackId, { relays: getRelays() });
   } catch {
     return [];
   }
@@ -1313,9 +1389,12 @@ function renderPostCard(
   const eventId = typeof event?.id === "string" ? event.id : "";
   const pubkeyHex = typeof event?.pubkey === "string" ? event.pubkey : "";
   const createdAt = typeof event?.created_at === "number" ? event.created_at : Number(event?.created_at);
-  const content = typeof event?.content === "string" ? event.content : "";
+  const isRepost = isRepostEvent(event);
+  const contentEvent = getContentEvent(event);
+  const displayEvent = contentEvent || event;
+  const content = typeof contentEvent?.content === "string" ? contentEvent.content : "";
 
-  const type = getPostTypeFromTags(event?.tags);
+  const type = getPostTypeFromTags(displayEvent?.tags);
   const when = formatTimestamp(createdAt);
 
   const authorLink = pubkeyHex ? `#/p/${encodeURIComponent(pubkeyHex)}` : "#/community";
@@ -1342,6 +1421,7 @@ function renderPostCard(
     whenEl,
   ]);
   if (type) meta.append(el("span", { class: "badge", text: type }));
+  if (isRepost) meta.append(el("span", { class: "badge", text: "Repost" }));
 
   const menu = renderPostMenu(event, menuOptions);
   if (menu) meta.append(menu);
@@ -1351,6 +1431,29 @@ function renderPostCard(
   if (selectable) card.classList.add("post-card--selectable");
   if (selectionMode) card.classList.add("selection-mode");
   if (selected) card.classList.add("is-selected");
+  if (isRepost) {
+    const originalId =
+      (typeof contentEvent?.id === "string" ? contentEvent.id : "") || getRepostTargetId(event);
+    const originalPubkey = normalizeHexPubkey(
+      (typeof contentEvent?.pubkey === "string" ? contentEvent.pubkey : "") ||
+        getTagValues(event?.tags, "p")[0] ||
+        ""
+    );
+    const repostLine = el("div", { class: "muted", style: "font-size: 0.9em;" });
+    repostLine.append(document.createTextNode("Rebroadcasted"));
+    if (originalPubkey) {
+      repostLine.append(document.createTextNode(" from "));
+      repostLine.append(
+        el("a", { href: `#/p/${encodeURIComponent(originalPubkey)}`, text: shortHex(originalPubkey) })
+      );
+    }
+    if (originalId) {
+      repostLine.append(document.createTextNode(" · "));
+      repostLine.append(el("a", { href: `#/post/${encodeURIComponent(originalId)}`, text: "View original" }));
+    }
+    card.append(repostLine);
+  }
+
   if (content) card.append(el("div", { style: "white-space: pre-wrap;" }, [document.createTextNode(content)]));
 
   const embed = getEmbeddableUrlForEvent(event);
@@ -1411,6 +1514,14 @@ async function init() {
 
   try {
     await initAuth();
+    try {
+      const settings = await getSettings();
+      if (Array.isArray(settings?.relays) && settings.relays.length) {
+        setRelays(settings.relays);
+      }
+    } catch {
+      // ignore relay settings load failure
+    }
     const initialAccountPubkey = normalizeHexPubkey(getActiveAccountPubkey());
     const initialDisplayPubkey = normalizeHexPubkey(getActivePubkey());
     let signedInPubkey = initialDisplayPubkey || initialAccountPubkey || null;
@@ -1846,7 +1957,7 @@ async function init() {
   const refreshTracksFromRelays = async () => {
     let latestTracks = [];
     try {
-      latestTracks = await fetchTracksFromRelays();
+      latestTracks = await fetchTracksFromRelays({ relays: getRelays() });
     } catch {
       latestTracks = [];
     }
@@ -1983,7 +2094,7 @@ async function init() {
         }
 
         proofUi.status.textContent = `Publishing ${signedEvent.id}…`;
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         console.log("proof publish results", results);
 
         const ok = Object.values(results).some((r) => r?.ok);
@@ -2137,6 +2248,103 @@ async function init() {
       remotePanel.append(qrBox, connectTextarea, buttonRow, pasteRow, remoteStatus);
     }
     grid.append(remotePanel);
+
+    const relaysPanel = el("section", { class: "auth-panel" });
+    relaysPanel.append(el("h3", { text: "Relays", style: "margin:0;" }));
+    relaysPanel.append(
+      el("p", {
+        class: "muted",
+        text: "Relays used for reading and publishing. One per line.",
+      })
+    );
+    const relayTextarea = el("textarea", {
+      rows: "5",
+      class: "mono",
+      spellcheck: "false",
+      placeholder: "wss://relay.example",
+    });
+    relayTextarea.value = getRelays().join("\n");
+    const relayStatus = el("div", { class: "muted" });
+    const relaySaveBtn = el("button", { type: "button", text: "Save relays" });
+    const relayTestBtn = el("button", { type: "button", text: "Test relays" });
+    const relayResetBtn = el("button", { type: "button", text: "Reset defaults" });
+    const relayBtnRow = el("div", { class: "auth-row" }, [relaySaveBtn, relayTestBtn, relayResetBtn]);
+    relaysPanel.append(relayTextarea, relayBtnRow, relayStatus);
+    grid.append(relaysPanel);
+
+    const parseRelayInput = () => {
+      const raw = relayTextarea.value || "";
+      const values = raw
+        .split(/[\n,]+/)
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
+      return normalizeRelayList(values);
+    };
+
+    relaySaveBtn.addEventListener("click", async () => {
+      relayStatus.textContent = "";
+      const relays = parseRelayInput();
+      if (!relays.length) {
+        relayStatus.textContent = "Add at least one relay.";
+        return;
+      }
+      relaySaveBtn.disabled = true;
+      relayTestBtn.disabled = true;
+      relayResetBtn.disabled = true;
+      try {
+        await updateSettings({ relays });
+        setRelays(relays);
+        relayStatus.textContent = `Saved ${relays.length} relay(s).`;
+      } catch (err) {
+        relayStatus.textContent = `Save failed: ${err?.message || String(err)}`;
+      } finally {
+        relaySaveBtn.disabled = false;
+        relayTestBtn.disabled = false;
+        relayResetBtn.disabled = false;
+      }
+    });
+
+    relayTestBtn.addEventListener("click", async () => {
+      relayStatus.textContent = "";
+      const relays = parseRelayInput();
+      if (!relays.length) {
+        relayStatus.textContent = "Add at least one relay.";
+        return;
+      }
+      relaySaveBtn.disabled = true;
+      relayTestBtn.disabled = true;
+      relayResetBtn.disabled = true;
+      relayStatus.textContent = "Testing relays…";
+      try {
+        const { okRelays, failedRelays } = await probeRelays(relays, 1500);
+        relayStatus.textContent = `Reachable: ${okRelays.length}. Failed: ${failedRelays.length}.`;
+      } catch (err) {
+        relayStatus.textContent = `Test failed: ${err?.message || String(err)}`;
+      } finally {
+        relaySaveBtn.disabled = false;
+        relayTestBtn.disabled = false;
+        relayResetBtn.disabled = false;
+      }
+    });
+
+    relayResetBtn.addEventListener("click", async () => {
+      relayStatus.textContent = "";
+      relaySaveBtn.disabled = true;
+      relayTestBtn.disabled = true;
+      relayResetBtn.disabled = true;
+      try {
+        relayTextarea.value = RELAYS.join("\n");
+        await updateSettings({ relays: RELAYS });
+        setRelays(RELAYS);
+        relayStatus.textContent = "Reset to default relays.";
+      } catch (err) {
+        relayStatus.textContent = `Reset failed: ${err?.message || String(err)}`;
+      } finally {
+        relaySaveBtn.disabled = false;
+        relayTestBtn.disabled = false;
+        relayResetBtn.disabled = false;
+      }
+    });
 
     let waiting = false;
     let currentSession = null;
@@ -2915,7 +3123,7 @@ async function init() {
         }
 
         composerStatus.textContent = `Publishing ${signedEvent.id}…`;
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         console.log("community publish results", results);
         const ok = Object.values(results).some((r) => r?.ok);
         if (!ok) {
@@ -2939,7 +3147,7 @@ async function init() {
 
     let posts = [];
     try {
-      posts = await fetchCommunityPosts({ limit: 50 });
+      posts = await fetchCommunityPosts({ limit: 50, relays: getRelays() });
     } catch {
       posts = [];
     }
@@ -2957,7 +3165,7 @@ async function init() {
       if (missing.length === 0) return false;
       let batch;
       try {
-        batch = await fetchProfiles(missing.slice(0, 40), { limit: 120 });
+        batch = await fetchProfiles(missing.slice(0, 40), { limit: 120, relays: getRelays() });
       } catch {
         batch = {};
       }
@@ -3020,7 +3228,7 @@ async function init() {
     app.append(box);
 
     try {
-      const post = await fetchPostById(eventId, { timeoutMs: 6500 });
+      const post = await fetchPostById(eventId, { timeoutMs: 6500, relays: getRelays() });
       if (seq !== renderSeq) return;
       box.innerHTML = "";
 
@@ -3047,7 +3255,7 @@ async function init() {
 
       applyProfile();
       if (pk && !profilesByPubkey.has(pk)) {
-        fetchProfiles([pk], { limit: 5 })
+        fetchProfiles([pk], { limit: 5, relays: getRelays() })
           .then((batch) => {
             const prof = batch?.[pk];
             if (prof) profilesByPubkey.set(pk, prof);
@@ -3093,7 +3301,7 @@ async function init() {
         const refreshAssertions = async () => {
           let assertions = [];
           try {
-            assertions = await fetchAssertionsForProof(proofId, { limit: 200 });
+            assertions = await fetchAssertionsForProof(proofId, { limit: 200, relays: getRelays() });
           } catch {
             assertions = [];
           }
@@ -3138,7 +3346,7 @@ async function init() {
           awardStatus.textContent = "Checking badge eligibility…";
           let badgeDef = null;
           try {
-            badgeDef = await fetchBadgeDefinitionForUnit(unitRef, { limit: 20 });
+            badgeDef = await fetchBadgeDefinitionForUnit(unitRef, { limit: 20, relays: getRelays() });
           } catch {
             badgeDef = null;
           }
@@ -3179,7 +3387,7 @@ async function init() {
 
           let awards = [];
           try {
-            const res = await fetchAwardedBadges(recipientPubkey, { limit: 500 });
+            const res = await fetchAwardedBadges(recipientPubkey, { limit: 500, relays: getRelays() });
             awards = Array.isArray(res?.awards) ? res.awards : [];
           } catch {
             awards = [];
@@ -3261,7 +3469,7 @@ async function init() {
               pubkey: me,
             };
             const signedEvent = await signEvent(unsignedEvent);
-            const results = await publishEventToRelays(RELAYS, signedEvent);
+            const results = await publishEventToRelays(getRelays(), signedEvent);
             logRelayResults("assertion publish results", results);
             const ok = Object.values(results).some((r) => r?.ok);
             verifyStatus.textContent = ok ? `Verified (${signedEvent.id}).` : "Verify failed (no relays reported OK).";
@@ -3304,7 +3512,7 @@ async function init() {
 
     let defs = [];
     try {
-      defs = await fetchAllBadgeDefinitions({ limit: 500 });
+      defs = await fetchAllBadgeDefinitions({ limit: 500, relays: getRelays() });
     } catch {
       defs = [];
     }
@@ -3313,7 +3521,7 @@ async function init() {
     const addresses = defs.map((d) => d?.address).filter(Boolean);
     let countsByAddress = {};
     try {
-      const stats = await fetchBadgeAwardCounts(addresses, { limit: 2500, chunkSize: 20 });
+      const stats = await fetchBadgeAwardCounts(addresses, { limit: 2500, chunkSize: 20, relays: getRelays() });
       countsByAddress = stats?.countsByAddress || {};
     } catch {
       countsByAddress = {};
@@ -3431,8 +3639,8 @@ async function init() {
     let awards = [];
     try {
       [def, awards] = await Promise.all([
-        fetchBadgeDefinitionByAddress(address),
-        fetchBadgeAwardEventsForBadgeAddress(address, { limit: 2500 }),
+        fetchBadgeDefinitionByAddress(address, { relays: getRelays() }),
+        fetchBadgeAwardEventsForBadgeAddress(address, { limit: 2500, relays: getRelays() }),
       ]);
     } catch {
       def = null;
@@ -3461,7 +3669,7 @@ async function init() {
     const creatorPubkey = typeof def?.pubkey === "string" ? normalizeHexPubkey(def.pubkey) : "";
     let creatorProfile = null;
     try {
-      creatorProfile = creatorPubkey ? await fetchProfile(creatorPubkey) : null;
+      creatorProfile = creatorPubkey ? await fetchProfile(creatorPubkey, { relays: getRelays() }) : null;
     } catch {
       creatorProfile = null;
     }
@@ -3469,7 +3677,7 @@ async function init() {
 
     let holdersProfiles = {};
     try {
-      holdersProfiles = await fetchProfiles(holderPubkeys.slice(0, 60), { limit: 180 });
+      holdersProfiles = await fetchProfiles(holderPubkeys.slice(0, 60), { limit: 180, relays: getRelays() });
     } catch {
       holdersProfiles = {};
     }
@@ -3559,7 +3767,7 @@ async function init() {
 
     let profile = null;
     try {
-      profile = await fetchProfile(pubkey);
+      profile = await fetchProfile(pubkey, { relays: getRelays() });
     } catch {
       profile = null;
     }
@@ -3686,7 +3894,7 @@ async function init() {
         }
 
         saveStatus.textContent = `Publishing ${signedEvent.id}…`;
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         const ok = Object.values(results).some((r) => r?.ok);
         if (!ok) {
           saveStatus.textContent = "Publish failed (no relays reported OK).";
@@ -3712,7 +3920,10 @@ async function init() {
       let awarded = null;
       let badgePrefs = null;
       try {
-        [awarded, badgePrefs] = await Promise.all([fetchAwardedBadges(pubkey), fetchBadgePrefs(pubkey)]);
+        [awarded, badgePrefs] = await Promise.all([
+          fetchAwardedBadges(pubkey, { relays: getRelays() }),
+          fetchBadgePrefs(pubkey, { relays: getRelays() }),
+        ]);
       } catch {
         awarded = { awards: [], definitionsByAddress: {} };
         badgePrefs = null;
@@ -3846,7 +4057,7 @@ async function init() {
     const loadCreatedBadges = async () => {
       let createdBadges = [];
       try {
-        createdBadges = await fetchBadgesCreatedBy(pubkey, { limit: 200 });
+        createdBadges = await fetchBadgesCreatedBy(pubkey, { limit: 200, relays: getRelays() });
       } catch {
         createdBadges = [];
       }
@@ -3957,7 +4168,7 @@ async function init() {
         if (missing.length === 0) return false;
         let batch;
         try {
-          batch = await fetchProfiles(missing.slice(0, 40), { limit: 120 });
+          batch = await fetchProfiles(missing.slice(0, 40), { limit: 120, relays: getRelays() });
         } catch {
           batch = {};
         }
@@ -4111,7 +4322,7 @@ async function init() {
         if (fromCache.length === ids.length) return fromCache;
         let fetched = [];
         try {
-          fetched = await fetchPostsByIds(ids, { limit: ids.length });
+          fetched = await fetchPostsByIds(ids, { limit: ids.length, relays: getRelays() });
         } catch {
           fetched = [];
         }
@@ -4147,8 +4358,8 @@ async function init() {
       let pinnedIds = [];
       try {
         const [pinned, fetchedPosts] = await Promise.all([
-          fetchPinnedEventIds(pubkey).catch(() => []),
-          fetchYoyostrPostsByAuthor(pubkey, { limit: 50 }).catch(() => []),
+          fetchPinnedEventIds(pubkey, { relays: getRelays() }).catch(() => []),
+          fetchYoyostrPostsByAuthor(pubkey, { limit: 50, relays: getRelays() }).catch(() => []),
         ]);
         pinnedIds = Array.isArray(pinned) ? pinned : [];
         posts = Array.isArray(fetchedPosts) ? fetchedPosts : [];
@@ -4182,7 +4393,7 @@ async function init() {
           setStatus(statusEl, `Pin sign failed: ${err?.message || String(err)}`, { error: true });
           return;
         }
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         const ok = Object.values(results).some((r) => r?.ok);
         if (!ok) {
           setStatus(statusEl, "Pin publish failed (no relays reported OK).", { error: true });
@@ -4279,6 +4490,8 @@ async function init() {
       let otherHasMore = true;
       const otherFetchLimit = 80;
       let otherFetchInFlight = false;
+      const otherAutoLoadLimit = 4;
+      let otherAutoLoadAttempts = 0;
 
       const otherControls = el("div", { class: "post-controls" });
       const searchInput = el("input", {
@@ -4478,6 +4691,7 @@ async function init() {
           response = await fetchOtherPostsByAuthor(pubkey, {
             limit: otherFetchLimit,
             until: otherFetchUntil,
+            relays: getRelays(),
           });
         } catch {
           response = null;
@@ -4507,7 +4721,12 @@ async function init() {
         otherPosts = [];
         otherFetchUntil = null;
         otherHasMore = true;
-        await loadMoreOtherPosts();
+        otherAutoLoadAttempts = 0;
+        do {
+          await loadMoreOtherPosts();
+          otherAutoLoadAttempts += 1;
+          if (seq !== renderSeq) return;
+        } while (otherPosts.length === 0 && otherHasMore && otherAutoLoadAttempts < otherAutoLoadLimit);
         otherPostsLoaded = true;
         otherPostsLoading = false;
         if (seq !== renderSeq) return;
@@ -4737,7 +4956,7 @@ async function init() {
 
     let badgeDefs = [];
     try {
-      badgeDefs = await fetchBadgeDefinitionsForUnit(unitRef);
+      badgeDefs = await fetchBadgeDefinitionsForUnit(unitRef, { relays: getRelays() });
     } catch {
       badgeDefs = [];
     }
@@ -4893,7 +5112,7 @@ async function init() {
         }
 
         try {
-          badgeDefs = await fetchBadgeDefinitionsForUnit(unitRef);
+          badgeDefs = await fetchBadgeDefinitionsForUnit(unitRef, { relays: getRelays() });
         } catch {
           badgeDefs = [];
         }
@@ -4921,7 +5140,7 @@ async function init() {
 
     let proofs = [];
     try {
-      proofs = await fetchProofsForUnit(unitRef, { limit: 20 });
+      proofs = await fetchProofsForUnit(unitRef, { limit: 20, relays: getRelays() });
     } catch {
       proofs = [];
     }
@@ -4930,7 +5149,7 @@ async function init() {
     let heldBadgeAddressSet = new Set();
     if (signedInPubkey) {
       try {
-        const { awards } = await fetchAwardedBadges(signedInPubkey, { limit: 200 });
+        const { awards } = await fetchAwardedBadges(signedInPubkey, { limit: 200, relays: getRelays() });
         heldBadgeAddressSet = new Set(
           awards
             .flatMap((ev) => getTagValues(ev?.tags, "a"))
@@ -5070,7 +5289,7 @@ async function init() {
                 pubkey: normalizeHexPubkey(signedInPubkey),
               };
               const signedEvent = await signEvent(unsignedEvent);
-              const results = await publishEventToRelays(RELAYS, signedEvent);
+              const results = await publishEventToRelays(getRelays(), signedEvent);
               logRelayResults("denial publish results", results);
               const ok = Object.values(results).some((r) => r?.ok);
               status.textContent = ok ? `Denied (${signedEvent.id}).` : "Denial publish failed (no relays reported OK).";
@@ -5095,11 +5314,14 @@ async function init() {
     renderProofsWithNames(proofsBox, proofs);
 
     fetchProfiles(
-      Array.from(new Set(proofs.map((ev) => (typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "")).filter(Boolean))).slice(
-        0,
-        40
-      ),
-      { limit: 120 }
+      Array.from(
+        new Set(
+          proofs
+            .map((ev) => (typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : ""))
+            .filter(Boolean)
+        )
+      ).slice(0, 40),
+      { limit: 120, relays: getRelays() }
     )
       .then((batch) => {
         for (const [pubkey, prof] of Object.entries(batch || {})) {
@@ -5412,8 +5634,8 @@ async function init() {
           return;
         }
 
-        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${RELAYS.length} relays…`);
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${getRelays().length} relays…`);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         for (const [relayUrl, result] of Object.entries(results)) {
           const okText = result?.ok ? "OK" : "FAIL";
           const msg = typeof result?.message === "string" && result.message ? ` - ${result.message}` : "";
@@ -5550,8 +5772,8 @@ async function init() {
           return;
         }
 
-        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${RELAYS.length} relays…`);
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${getRelays().length} relays…`);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         for (const [relayUrl, result] of Object.entries(results)) {
           const okText = result?.ok ? "OK" : "FAIL";
           const msg = typeof result?.message === "string" && result.message ? ` - ${result.message}` : "";
@@ -5639,8 +5861,8 @@ async function init() {
           return;
         }
 
-        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${RELAYS.length} relays…`);
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${getRelays().length} relays…`);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         for (const [relayUrl, result] of Object.entries(results)) {
           const okText = result?.ok ? "OK" : "FAIL";
           const msg = typeof result?.message === "string" && result.message ? ` - ${result.message}` : "";
@@ -5718,8 +5940,8 @@ async function init() {
           return;
         }
 
-        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${RELAYS.length} relays…`);
-        const results = await publishEventToRelays(RELAYS, signedEvent);
+        appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${getRelays().length} relays…`);
+        const results = await publishEventToRelays(getRelays(), signedEvent);
         for (const [relayUrl, result] of Object.entries(results)) {
           const okText = result?.ok ? "OK" : "FAIL";
           const msg = typeof result?.message === "string" && result.message ? ` - ${result.message}` : "";
@@ -5862,8 +6084,8 @@ async function init() {
         continue;
       }
 
-      appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${RELAYS.length} relays…`);
-      const results = await publishEventToRelays(RELAYS, signedEvent);
+      appendLog(adminUi.log, `Publishing ${signedEvent.id} to ${getRelays().length} relays…`);
+      const results = await publishEventToRelays(getRelays(), signedEvent);
       for (const [relayUrl, result] of Object.entries(results)) {
         const okText = result?.ok ? "OK" : "FAIL";
         const msg = typeof result?.message === "string" && result.message ? ` - ${result.message}` : "";

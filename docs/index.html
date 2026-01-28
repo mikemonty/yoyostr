@@ -42,11 +42,12 @@
         background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,0)) , var(--header-bg);
         border-bottom: 1px solid rgba(255,255,255,.10);
       }
-      header { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 18px 0; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 18px 0; flex-wrap: wrap; }
       header h1 { margin: 0; font-size: 28px; }
       header h1 a { color: inherit; text-decoration: none; }
       header p { margin: 6px 0 0; color: var(--header-muted); }
       header h1 { color: var(--header-text); letter-spacing: -0.02em; }
+      header > div { min-width: 0; }
       #app { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 24px 0 40px; }
       .track-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 14px; backdrop-filter: blur(10px); }
       .track-card h3 { margin: 0 0 6px; }
@@ -54,6 +55,7 @@
       .track-links { display: flex; flex-wrap: wrap; gap: 10px; }
       .track-links a { text-decoration: none; border-bottom: 1px solid var(--link-underline); }
       .muted { opacity: .85; color: var(--text-muted); }
+      #activeSignerLabel { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
       #status { margin: 6px 0 16px; min-height: 1.2em; }
       .crumbs { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
       .crumbs a { text-decoration: none; border-bottom: 1px solid var(--link-underline); }
@@ -83,7 +85,9 @@
       }
       .topnav a:hover { background: rgba(255,255,255,.10); }
       .topnav a[aria-current="page"] { color: var(--header-text); border-color: rgba(255,255,255,.22); background: rgba(255,255,255,.12); font-weight: 650; }
-      .post-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 12px; display: grid; gap: 10px; backdrop-filter: blur(10px); position: relative; z-index: 0; }
+      .post-card { border: 1px solid var(--panel-border); background: var(--panel-bg); border-radius: 14px; padding: 12px; display: grid; gap: 10px; backdrop-filter: blur(10px); position: relative; z-index: 0; margin-bottom: 12px; }
+      .post-list .post-card,
+      .post-grid .post-card { margin-bottom: 0; }
       .post-card--menu-open { z-index: 20; }
       .post-card--compact { padding: 10px; font-size: 13px; }
       .post-card--selectable { position: relative; }
@@ -114,6 +118,9 @@
       .post-list { display: grid; gap: 12px; }
       .post-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
       @media (max-width: 720px) {
+        header { align-items: flex-start; }
+        header > div:last-child { width: 100%; }
+        #activeSignerLabel { flex-basis: 100%; }
         .post-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
       }
       .post-tabs { display:flex; gap: 8px; flex-wrap: wrap; }

@@ -1061,7 +1061,7 @@ export async function canAwardBadge({ currentUserPubkeyHex, unitRef } = {}, opti
 
 export async function fetchCommunityPosts(options = {}) {
   const limit = toNumberOrNull(options.limit) ?? 50;
-  const filter = { kinds: [1], "#t": [APP_TAG], limit };
+  const filter = { kinds: [1, 6, 16], "#t": [APP_TAG], limit };
 
   const events = await fetchEventsFromRelays(filter, options);
   events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
@@ -1076,7 +1076,8 @@ export async function fetchPostById(eventId, options = {}) {
   const events = await fetchEventsFromRelays(filter, options);
   const match = events.find((ev) => typeof ev?.id === "string" && ev.id === id) || null;
   if (!match) return null;
-  if (toNumberOrNull(match.kind) !== 1) return null;
+  const kind = toNumberOrNull(match.kind);
+  if (kind !== 1 && kind !== 6 && kind !== 16) return null;
   return match;
 }
 
@@ -1186,7 +1187,7 @@ export async function fetchYoyostrPostsByAuthor(pubkeyHex, options = {}) {
   if (!pubkey) return [];
 
   const limit = toNumberOrNull(options.limit) ?? 50;
-  const filter = { kinds: [1], authors: [pubkey], "#t": [APP_TAG], limit };
+  const filter = { kinds: [1, 6, 16], authors: [pubkey], "#t": [APP_TAG], limit };
   const since = toNumberOrNull(options.since);
   const until = toNumberOrNull(options.until);
   if (since !== null) filter.since = since;
