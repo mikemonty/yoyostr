@@ -97,6 +97,27 @@ function relayLabel(relay) {
   return "";
 }
 
+function isBenignCloseError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return (
+    msg.includes("relay connection closed by us") ||
+    msg.includes("relay connection errored") ||
+    msg.includes("websocket error")
+  );
+}
+
+function safeClose(promiseLike, label) {
+  if (!promiseLike) return;
+  // nostr-tools can reject on intentional close; ignore that specific teardown noise.
+  const items = Array.isArray(promiseLike) ? promiseLike : [promiseLike];
+  for (const item of items) {
+    Promise.resolve(item).catch((err) => {
+      if (isBenignCloseError(err)) return;
+      console.warn(`[YOYOSTR] ${label} failed`, err);
+    });
+  }
+}
+
 function attachRelayHooks(relay, relayUrl, context) {
   if (!relay || typeof relay.on !== "function") return;
   if (hookedRelays.has(relay)) return;
@@ -532,7 +553,7 @@ function subscribeForResponses(session, onEvent, options = {}) {
           sub?.close?.();
         } finally {
           try {
-            pool.close?.(relays);
+            safeClose(pool.close?.(relays), "pool.close");
           } catch {
             // ignore
           }
@@ -552,7 +573,7 @@ function subscribeForResponses(session, onEvent, options = {}) {
           sub.unsubscribe?.();
         } finally {
           try {
-            pool.close?.(relays);
+            safeClose(pool.close?.(relays), "pool.close");
           } catch {
             // ignore
           }
@@ -571,7 +592,7 @@ function subscribeForResponses(session, onEvent, options = {}) {
           sub.unsubscribe?.();
         } finally {
           try {
-            pool.close?.(relays);
+            safeClose(pool.close?.(relays), "pool.close");
           } catch {
             // ignore
           }

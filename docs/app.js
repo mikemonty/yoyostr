@@ -188,6 +188,94 @@ function formatTimestamp(ts) {
   }
 }
 
+function getPostPermalink(eventId) {
+  const id = typeof eventId === "string" ? eventId.trim() : "";
+  if (!id) return "";
+  const origin =
+    typeof window !== "undefined" && window.location ? `${window.location.origin}${window.location.pathname}` : "";
+  return `${origin}#/post/${encodeURIComponent(id)}`;
+}
+
+function announcePostStatus(statusEl, message, options = {}) {
+  if (!statusEl || !message) return;
+  setStatus(statusEl, message, options);
+}
+
+async function sharePost(event, statusEl) {
+  const eventId = typeof event?.id === "string" ? event.id : "";
+  if (!eventId) {
+    announcePostStatus(statusEl, "Cannot share this post.", { error: true });
+    return;
+  }
+  const url = getPostPermalink(eventId);
+  const content = typeof event?.content === "string" ? event.content.trim() : "";
+  const text = content ? content.slice(0, 140) : "YoYoStr post";
+
+  if (navigator?.share) {
+    try {
+      await navigator.share({ title: "YoYoStr", text, url });
+      return;
+    } catch (err) {
+      if (err?.name === "AbortError") return;
+      // fallback to clipboard
+    }
+  }
+
+  if (navigator?.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(url);
+      announcePostStatus(statusEl, "Post link copied.");
+      return;
+    } catch {
+      // ignore clipboard failure
+    }
+  }
+
+  announcePostStatus(statusEl, "Share failed. Copy the link from the address bar.", { error: true });
+}
+
+async function rebroadcastPost(event, statusEl) {
+  const eventId = typeof event?.id === "string" ? event.id : "";
+  const sig = typeof event?.sig === "string" ? event.sig : "";
+  if (!eventId || !sig) {
+    announcePostStatus(statusEl, "Cannot rebroadcast this post.", { error: true });
+    return;
+  }
+  announcePostStatus(statusEl, "Rebroadcasting…");
+  try {
+    const results = await publishEventToRelays(RELAYS, event);
+    const okRelays = [];
+    const failedRelays = [];
+    for (const [relay, result] of Object.entries(results || {})) {
+      if (result?.ok) okRelays.push(relay);
+      else failedRelays.push(relay);
+    }
+    if (okRelays.length === 0) {
+      announcePostStatus(statusEl, "Rebroadcast failed (no relays reported OK).", { error: true });
+      return;
+    }
+    const primalResult = results?.[PRIMAL_RELAY];
+    const primalOk = Boolean(primalResult?.ok);
+    if (!primalOk) {
+      const reason = primalResult?.timeout
+        ? "timeout"
+        : typeof primalResult?.message === "string" && primalResult.message
+          ? primalResult.message
+          : "no OK response";
+      announcePostStatus(
+        statusEl,
+        `Rebroadcasted to ${okRelays.length} relay(s), but Primal relay did not respond OK (${reason}).`,
+        { error: true }
+      );
+      return;
+    }
+    const suffix = failedRelays.length ? ` (${failedRelays.length} relay(s) failed.)` : "";
+    announcePostStatus(statusEl, `Rebroadcasted to ${okRelays.length} relay(s).${suffix}`);
+  } catch (err) {
+    announcePostStatus(statusEl, `Rebroadcast failed: ${err?.message || String(err)}`, { error: true });
+  }
+}
+
 function cleanUrlToken(token) {
   const raw = typeof token === "string" ? token.trim() : "";
   if (!raw) return "";
@@ -337,6 +425,26 @@ async function probeRelays(relays, timeoutMs = 1500) {
   const okRelays = results.filter((r) => r.ok).map((r) => r.url);
   const failedRelays = results.filter((r) => !r.ok).map((r) => r.url);
   return { okRelays, failedRelays };
+}
+
+function normalizeRelayList(relays) {
+  const list = Array.isArray(relays) ? relays : [];
+  const out = [];
+  const seen = new Set();
+  for (const relay of list) {
+    const url = typeof relay === "string" ? relay.trim().replace(/\/+$/, "") : "";
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+function relaysMatch(a, b) {
+  const left = normalizeRelayList(a);
+  const right = normalizeRelayList(b);
+  if (left.length !== right.length) return false;
+  return left.every((value, idx) => value === right[idx]);
 }
 
 // Classifies an event as video, image, or text based on embed/image detection.
@@ -1027,9 +1135,180 @@ function renderEmbedArea(video) {
   return el("div", { class: "embed-box" }, [iframe]);
 }
 
+function renderPostMenu(event, options = {}) {
+  const {
+    enable = true,
+    canPin = false,
+    canHide = false,
+    isPinned = false,
+    onPin = null,
+    onHide = null,
+    onShare = null,
+    onRebroadcast = null,
+    statusEl = null,
+    portal = null,
+  } = options || {};
+
+  if (!enable) return null;
+
+  const items = [];
+  if (canPin) {
+    items.push({
+      label: isPinned ? "Unpin" : "Pin",
+      action: () => onPin?.(event),
+    });
+  }
+  items.push({
+    label: "Share",
+    action: () => (typeof onShare === "function" ? onShare(event) : sharePost(event, statusEl)),
+  });
+  items.push({
+    label: "Rebroadcast",
+    action: () => (typeof onRebroadcast === "function" ? onRebroadcast(event) : rebroadcastPost(event, statusEl)),
+  });
+  if (canHide) {
+    items.push({
+      label: "Hide",
+      action: () => onHide?.(event),
+    });
+  }
+
+  if (!items.length) return null;
+
+  const menu = el("div", { class: "post-menu" });
+  menu.setAttribute("data-menu-root", "true");
+  const btn = el("button", {
+    type: "button",
+    class: "post-menu-btn",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    title: "Post options",
+  });
+  btn.textContent = "⋯";
+
+  const list = el("div", { class: "post-menu-list", role: "menu", "aria-hidden": "true" });
+
+  const addItem = (item) => {
+    const itemBtn = el("button", { type: "button", class: "post-menu-item", role: "menuitem", text: item.label });
+    itemBtn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeMenu();
+      try {
+        await item.action?.();
+      } catch {
+        // ignore action failures
+      }
+    });
+    list.append(itemBtn);
+  };
+
+  for (const item of items) addItem(item);
+
+  let isOpen = false;
+  let removeListeners = null;
+  let previousParent = null;
+  let placeholder = null;
+  const hostCard = menu.closest?.(".post-card");
+
+  const applyPortalPosition = () => {
+    const rect = menu.getBoundingClientRect();
+    list.style.position = "fixed";
+    list.style.right = "auto";
+    list.style.top = "auto";
+    list.style.left = `${Math.max(6, rect.right - list.offsetWidth)}px`;
+    list.style.top = `${Math.max(6, rect.bottom + 6)}px`;
+  };
+
+  const closeMenu = () => {
+    if (!isOpen) return;
+    isOpen = false;
+    list.setAttribute("aria-hidden", "true");
+    btn.setAttribute("aria-expanded", "false");
+    if (hostCard) hostCard.classList.remove("post-card--menu-open");
+    list.style.position = "";
+    list.style.left = "";
+    list.style.top = "";
+    list.style.right = "";
+    list.style.transform = "";
+    if (portal && previousParent) {
+      menu.append(list);
+      if (placeholder && placeholder.parentNode) placeholder.parentNode.removeChild(placeholder);
+      previousParent = null;
+      placeholder = null;
+    }
+    if (removeListeners) {
+      removeListeners();
+      removeListeners = null;
+    }
+  };
+
+  const openMenu = () => {
+    if (isOpen) return;
+    isOpen = true;
+    list.setAttribute("aria-hidden", "false");
+    btn.setAttribute("aria-expanded", "true");
+    if (hostCard) hostCard.classList.add("post-card--menu-open");
+    if (portal) {
+      previousParent = list.parentNode;
+      placeholder = document.createElement("span");
+      placeholder.style.display = "none";
+      if (list.parentNode) list.parentNode.insertBefore(placeholder, list);
+      portal.append(list);
+      list.style.transform = "translateZ(0)";
+      requestAnimationFrame(() => applyPortalPosition());
+    }
+    const handleDocClick = (ev) => {
+      if (menu.contains(ev.target)) return;
+      if (list.contains(ev.target)) return;
+      closeMenu();
+    };
+    const handleScroll = () => {
+      if (portal) applyPortalPosition();
+    };
+    const handleKey = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeMenu();
+      }
+    };
+    document.addEventListener("click", handleDocClick, true);
+    document.addEventListener("keydown", handleKey);
+    window.addEventListener("scroll", handleScroll, true);
+    window.addEventListener("resize", handleScroll);
+    removeListeners = () => {
+      document.removeEventListener("click", handleDocClick, true);
+      document.removeEventListener("keydown", handleKey);
+      window.removeEventListener("scroll", handleScroll, true);
+      window.removeEventListener("resize", handleScroll);
+    };
+  };
+
+  btn.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (isOpen) closeMenu();
+    else openMenu();
+  });
+
+  list.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+  });
+
+  menu.append(btn, list);
+  return menu;
+}
+
 function renderPostCard(
   event,
-  { linkDate = false, selectable = false, selected = false, selectionMode = false, compact = false } = {}
+  {
+    linkDate = false,
+    selectable = false,
+    selected = false,
+    selectionMode = false,
+    compact = false,
+    menuOptions = {},
+  } = {}
 ) {
   const eventId = typeof event?.id === "string" ? event.id : "";
   const pubkeyHex = typeof event?.pubkey === "string" ? event.pubkey : "";
@@ -1064,6 +1343,9 @@ function renderPostCard(
   ]);
   if (type) meta.append(el("span", { class: "badge", text: type }));
 
+  const menu = renderPostMenu(event, menuOptions);
+  if (menu) meta.append(menu);
+
   const card = el("article", { class: "post-card" }, [meta]);
   if (compact) card.classList.add("post-card--compact");
   if (selectable) card.classList.add("post-card--selectable");
@@ -1095,13 +1377,13 @@ function renderPostCard(
   return card;
 }
 
-function renderPostList(container, events) {
+function renderPostList(container, events, options = {}) {
   container.innerHTML = "";
   if (!Array.isArray(events) || events.length === 0) {
     container.append(el("p", { class: "muted", text: "No posts yet." }));
     return;
   }
-  for (const ev of events) container.append(renderPostCard(ev));
+  for (const ev of events) container.append(renderPostCard(ev, options));
 }
 
 async function init() {
@@ -1139,6 +1421,10 @@ async function init() {
     const selectedVideoByUnitKey = new Map();
     let editUnitPreviewUrlInput = null;
     let renderSeq = 0;
+    let accountResolveAttempted = false;
+    let accountResolveInFlight = false;
+    let accountResolveRetries = 0;
+    let accountResolveTimer = null;
     const tracks = [];
     let tracksLoaded = false;
     const profilesByPubkey = new Map(); // pubkey -> profile object (kind 0)
@@ -1244,6 +1530,13 @@ async function init() {
     await clearActiveAuth();
     signedInPubkey = null;
     isMaintainer = false;
+    accountResolveAttempted = false;
+    accountResolveInFlight = false;
+    accountResolveRetries = 0;
+    if (accountResolveTimer) {
+      clearTimeout(accountResolveTimer);
+      accountResolveTimer = null;
+    }
     if (adminBtn) adminBtn.hidden = true;
     setStatus(statusEl, "Signed out.");
     updateAuthUi();
@@ -1941,19 +2234,6 @@ async function init() {
       }
     };
 
-    const normalizeRelayList = (relays) => {
-      const list = Array.isArray(relays) ? relays : [];
-      const out = [];
-      const seen = new Set();
-      for (const relay of list) {
-        const url = typeof relay === "string" ? relay.trim().replace(/\/+$/, "") : "";
-        if (!url || seen.has(url)) continue;
-        seen.add(url);
-        out.push(url);
-      }
-      return out;
-    };
-
     const resolveAccountPubkey = async (sessionRecord, options = {}) => {
       const attempts = Number.isFinite(options.attempts) ? options.attempts : 4;
       const timeoutMs = resolveNip46TimeoutMs(options.timeoutMs);
@@ -2081,73 +2361,25 @@ async function init() {
       needsSignatureConfirm = false;
       setDebugState({ remotePubkey: normalizeHexPubkey(remotePubkey) });
       logDebug("finalize connect", { remotePubkey });
-
-      if (resolvingAccount) return;
-      resolvingAccount = true;
-      scannedBtn.textContent = "Resolving account...";
-      scannedBtn.disabled = true;
-      pasteBtn.disabled = true;
-      continueBtn.disabled = true;
-      setRemoteStatus("Connected. Resolving account pubkey...");
-      setDebugState({ lastAction: "waiting for response..." });
-
-      let uiTimeout;
-      try {
-        uiTimeout = setTimeout(() => {
-          if (!resolvingAccount) return;
-          setRemoteStatus("Still waiting on account pubkey. Retry or continue anyway.", true);
-          scannedBtn.textContent = "Retry account key";
-          scannedBtn.disabled = false;
-          pasteBtn.disabled = false;
-          showContinueOption(true);
-          resolvingAccount = false;
-          setDebugState({ lastAction: "ui timeout fired (waiting on account pubkey)" });
-          logDebug("ui timeout fired", { sessionId: sessionRecord?.id });
-        }, 7000);
-
-        const resolvedPubkey = await resolveAccountPubkey(sessionRecord, {
-          attempts: 4,
-          timeoutMs: getDefaultTimeoutMs(),
-          delayMs: 900,
-        });
-
-        if (!resolvedPubkey) {
-          needsSignatureConfirm = true;
-          if (!handleNip46Timeout("get_public_key", sessionRecord)) {
-            setRemoteStatus(
-              "Connected, but couldn't read account pubkey. Request signature or continue anyway.",
-              true
-            );
-          }
-          scannedBtn.textContent = "Request signature";
-          scannedBtn.disabled = false;
-          pasteBtn.disabled = false;
-          showContinueOption(true);
-          setDebugState({ lastAction: "get_public_key failed; awaiting signature" });
-          logDebug("get_public_key failed; awaiting signature");
-          return;
-        }
-
-        setDebugState({
-          lastAction: "resolved account pubkey",
-          resolvedPubkey: normalizeHexPubkey(resolvedPubkey),
-        });
-        logDebug("resolved account pubkey", { pubkey: resolvedPubkey });
-        scannedBtn.textContent = "I scanned the QR";
-        scannedBtn.disabled = false;
-        pasteBtn.disabled = false;
-        showContinueOption(false);
-        await applyNip46Auth(sessionRecord, {
-          accountPubkey: resolvedPubkey,
-          remotePubkey: sessionRecord?.remotePubkey || lastRemotePubkey,
-        });
-      } finally {
-        resolvingAccount = false;
-        if (uiTimeout) clearTimeout(uiTimeout);
-        scannedBtn.disabled = false;
-        pasteBtn.disabled = false;
-        if (!continueBtn.hidden) continueBtn.disabled = false;
+      accountResolveAttempted = false;
+      accountResolveInFlight = false;
+      accountResolveRetries = 0;
+      if (accountResolveTimer) {
+        clearTimeout(accountResolveTimer);
+        accountResolveTimer = null;
       }
+
+      const normalizedRemote = normalizeHexPubkey(remotePubkey);
+      const existingAccount = normalizeHexPubkey(getActiveAccountPubkey());
+      const keepAccount = existingAccount && existingAccount !== normalizedRemote;
+      // Preserve any previously resolved account pubkey instead of overwriting with the signer key.
+      await applyNip46Auth(sessionRecord, {
+        accountPubkey: keepAccount ? existingAccount : null,
+        remotePubkey: normalizedRemote,
+        allowRemoteFallback: !keepAccount,
+      });
+      // Try to resolve the real account pubkey in the background (some signers use a distinct key).
+      tryResolveInBackground(sessionRecord);
     };
 
     const startWaiting = async (session) => {
@@ -2746,7 +2978,7 @@ async function init() {
         return;
       }
       for (const ev of events) {
-        const card = renderPostCard(ev, { linkDate: true });
+        const card = renderPostCard(ev, { linkDate: true, menuOptions: { statusEl, portal: document.body } });
         const pubkeyHex = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
         const profile = pubkeyHex ? profilesByPubkey.get(pubkeyHex) : null;
         const authorEl = card.querySelector?.('[data-role="author"]');
@@ -2797,7 +3029,7 @@ async function init() {
         return;
       }
 
-      const card = renderPostCard(post);
+      const card = renderPostCard(post, { menuOptions: { statusEl, portal: document.body } });
       box.append(card);
 
       const pk = typeof post?.pubkey === "string" ? normalizeHexPubkey(post.pubkey) : "";
@@ -3775,6 +4007,7 @@ async function init() {
             selected: isSelected,
             selectionMode: showSelectionMode,
             compact: viewMode === "grid",
+            menuOptions: { statusEl, portal: document.body },
           });
           const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
           const cached = pk ? profilesByPubkey.get(pk) : null;
@@ -3821,6 +4054,41 @@ async function init() {
 
       const selectedOtherPostIds = new Set(readSelectedOtherPostIds());
       const otherPostsById = new Map();
+      const hiddenPostsStorageKey = `yoyostr_hidden_posts_${pubkey}`;
+      const readHiddenPostIds = () => {
+        if (!isOwnProfile) return [];
+        try {
+          const raw = window?.localStorage?.getItem(hiddenPostsStorageKey);
+          const parsed = raw ? JSON.parse(raw) : [];
+          return Array.isArray(parsed)
+            ? parsed.map((id) => (typeof id === "string" ? id.trim() : "")).filter(Boolean)
+            : [];
+        } catch {
+          return [];
+        }
+      };
+      const hiddenPostIds = new Set(readHiddenPostIds());
+      const saveHiddenPostIds = () => {
+        if (!isOwnProfile) return;
+        try {
+          const ids = Array.from(hiddenPostIds);
+          window?.localStorage?.setItem(hiddenPostsStorageKey, JSON.stringify(ids));
+        } catch {
+          // ignore
+        }
+      };
+      const hidePost = (eventId) => {
+        if (!isOwnProfile) return;
+        const id = typeof eventId === "string" ? eventId.trim() : "";
+        if (!id) return;
+        hiddenPostIds.add(id);
+        saveHiddenPostIds();
+        if (pinnedIds.includes(id)) {
+          pinnedIds = pinnedIds.filter((x) => x !== id);
+          publishPins(pinnedIds);
+        }
+        renderPostsWithNames(postsBox, posts);
+      };
 
       // Render saved other posts beneath the YoYoStr posts list.
       const renderSelectedOtherPosts = (events) => {
@@ -3945,14 +4213,29 @@ async function init() {
 
       const renderPostsWithNames = (container, events) => {
         container.innerHTML = "";
-        const ordered = orderPosts(events);
+        const visible = (Array.isArray(events) ? events : []).filter((ev) => {
+          const id = typeof ev?.id === "string" ? ev.id : "";
+          return !id || !hiddenPostIds.has(id);
+        });
+        const ordered = orderPosts(visible);
         if (!Array.isArray(ordered) || ordered.length === 0) {
           container.append(el("p", { class: "muted", text: "No posts yet." }));
           return;
         }
         const pinnedSet = new Set(pinnedIds);
         for (const ev of ordered) {
-          const card = renderPostCard(ev, { linkDate: true });
+          const card = renderPostCard(ev, {
+            linkDate: true,
+            menuOptions: {
+              statusEl,
+              portal: document.body,
+              canPin: isOwnProfile,
+              canHide: isOwnProfile,
+              isPinned: Boolean(ev?.id && pinnedSet.has(ev.id)),
+              onPin: () => togglePin(ev.id),
+              onHide: () => hidePost(ev.id),
+            },
+          });
           const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
           const cached = pk ? profilesByPubkey.get(pk) : null;
           const authorEl = card.querySelector?.('[data-role="author"]');
@@ -3967,20 +4250,6 @@ async function init() {
           if (ev?.id && pinnedSet.has(ev.id)) {
             const meta = card.querySelector?.(".post-meta");
             if (meta) meta.append(el("span", { class: "badge", text: "Pinned" }));
-          }
-          if (isOwnProfile && ev?.id) {
-            const meta = card.querySelector?.(".post-meta");
-            if (meta) {
-              const btn = document.createElement("button");
-              btn.type = "button";
-              btn.textContent = pinnedSet.has(ev.id) ? "Unpin" : "Pin";
-              btn.addEventListener("click", (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                togglePin(ev.id);
-              });
-              meta.append(btn);
-            }
           }
           container.append(card);
         }
@@ -4180,7 +4449,11 @@ async function init() {
         return added;
       };
 
-      const updateOtherFetchCursor = () => {
+      const updateOtherFetchCursor = (cursorUntilOverride = null) => {
+        if (Number.isFinite(cursorUntilOverride)) {
+          otherFetchUntil = cursorUntilOverride;
+          return;
+        }
         if (otherPosts.length === 0) {
           otherFetchUntil = null;
           return;
@@ -4199,25 +4472,29 @@ async function init() {
         otherFetchInFlight = true;
         updateLoadMoreUi();
         otherStatus.textContent = "Loading more posts…";
-        let fetched = [];
+        let response = null;
         let hadError = false;
         try {
-          fetched = await fetchOtherPostsByAuthor(pubkey, {
+          response = await fetchOtherPostsByAuthor(pubkey, {
             limit: otherFetchLimit,
             until: otherFetchUntil,
           });
         } catch {
-          fetched = [];
+          response = null;
           hadError = true;
         }
         if (seq !== renderSeq) return;
+        const fetched = Array.isArray(response?.events) ? response.events : [];
+        const rawCount = Number.isFinite(response?.rawCount) ? response.rawCount : 0;
+        const cursorUntil = typeof response?.cursorUntil === "number" ? response.cursorUntil : null;
         const added = mergeOtherPosts(fetched);
-        updateOtherFetchCursor();
-        if (!hadError && (added === 0 || fetched.length === 0)) otherHasMore = false;
+        updateOtherFetchCursor(cursorUntil);
+        if (!hadError && rawCount === 0) otherHasMore = false;
         otherFetchInFlight = false;
         updateLoadMoreUi();
         if (hadError) otherStatus.textContent = "Load more failed. Try again.";
-        else otherStatus.textContent = added === 0 ? "No more posts found." : "";
+        else if (rawCount === 0) otherStatus.textContent = "No more posts found.";
+        else otherStatus.textContent = "";
         applyOtherFilters();
       };
 
@@ -4691,7 +4968,7 @@ async function init() {
 
       const list = el("div", { style: "display:grid; gap: 10px;" });
       for (const ev of events) {
-        const card = renderPostCard(ev);
+        const card = renderPostCard(ev, { menuOptions: { statusEl, portal: document.body } });
 
         const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
         const cached = pk ? profilesByPubkey.get(pk) : null;
@@ -4856,28 +5133,145 @@ async function init() {
         setPageTitle(["Profile"]);
         return;
       }
+      const remotePubkey = normalizeHexPubkey(getActiveRemotePubkey());
+      const accountPubkey = normalizeHexPubkey(getActiveAccountPubkey());
+      const effectiveAccountPubkey = accountPubkey && accountPubkey !== remotePubkey ? accountPubkey : "";
       if (getActiveAuthType() === "nip46") {
         try {
           const sessionId = getActiveNip46SessionId();
           const session = await getNip46Session(sessionId);
           if (session && session.status === "connected" && session.remotePubkey) {
-            const refreshed = await nip46RequestPublicKey(session, getDefaultTimeoutMs());
-            if (refreshed && normalizeHexPubkey(refreshed) !== normalizeHexPubkey(signedInPubkey)) {
-              signedInPubkey = normalizeHexPubkey(refreshed);
-              await setActiveAuth({
-                type: "nip46",
-                pubkey: refreshed,
-                remotePubkey: session.remotePubkey || getActiveRemotePubkey(),
-                sessionId: sessionId || session.id,
-              });
-              updateAuthUi();
-            }
+            // Refresh in the background so profile renders immediately.
+            (async () => {
+              try {
+                const refreshed = await nip46RequestPublicKey(session, getDefaultTimeoutMs());
+                if (refreshed && normalizeHexPubkey(refreshed) !== normalizeHexPubkey(signedInPubkey)) {
+                  signedInPubkey = normalizeHexPubkey(refreshed);
+                  await setActiveAuth({
+                    type: "nip46",
+                    pubkey: refreshed,
+                    remotePubkey: session.remotePubkey || getActiveRemotePubkey(),
+                    sessionId: sessionId || session.id,
+                  });
+                  updateAuthUi();
+                  if (parseRoute(window.location.hash).name === "profile") {
+                    await renderProfile(signedInPubkey, { isSelf: true });
+                  }
+                }
+              } catch {
+                // ignore refresh failures
+              }
+            })();
           }
         } catch {
           // ignore refresh failures
         }
+        if (!effectiveAccountPubkey) {
+          app.innerHTML = "";
+          app.append(el("h2", { text: "Your Profile", style: "margin: 0 0 12px;" }));
+          app.append(
+            el("p", {
+              class: "muted",
+              text: "Connected via remote signer. Resolving your account key...",
+            })
+          );
+          const resolveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+          const retryBtn = el("button", { type: "button", text: "Retry resolve" });
+          app.append(resolveStatus, retryBtn);
+
+          const scheduleRetry = (delayMs) => {
+            if (accountResolveTimer) return;
+            const waitMs = Number.isFinite(delayMs) ? delayMs : 5000;
+            accountResolveTimer = setTimeout(() => {
+              accountResolveTimer = null;
+              if (parseRoute(window.location.hash).name !== "profile") return;
+              const latestAccount = normalizeHexPubkey(getActiveAccountPubkey());
+              const latestRemote = normalizeHexPubkey(getActiveRemotePubkey());
+              if (latestAccount && latestAccount !== latestRemote) return;
+              attemptResolve(true);
+            }, waitMs);
+          };
+
+          const attemptResolve = async (auto = false) => {
+            if (accountResolveInFlight) return;
+            accountResolveInFlight = true;
+            accountResolveAttempted = true;
+            accountResolveRetries += 1;
+            retryBtn.disabled = true;
+            resolveStatus.textContent = auto ? "Retrying account key resolution…" : "Resolving your account key...";
+            try {
+              const sessionId = getActiveNip46SessionId();
+              let session = await getNip46Session(sessionId);
+              if (!session || session.status !== "connected" || !session.remotePubkey) {
+                resolveStatus.textContent = "Remote signer not connected. Reconnect and try again.";
+                return;
+              }
+
+              const settings = await getSettings();
+              const settingsRelays =
+                Array.isArray(settings?.relays) && settings.relays.length ? settings.relays : RELAYS;
+              const baseRelays = normalizeRelayList([PRIMAL_RELAY, ...settingsRelays]);
+              let okRelays = [];
+              try {
+                ({ okRelays } = await probeRelays(baseRelays, 1500));
+              } catch {
+                okRelays = [];
+              }
+              const nextRelays = okRelays.length ? normalizeRelayList([PRIMAL_RELAY, ...okRelays]) : baseRelays;
+              if (nextRelays.length && !relaysMatch(session.relays, nextRelays)) {
+                session = (await updateNip46Session(session.id, { relays: nextRelays })) || {
+                  ...session,
+                  relays: nextRelays,
+                };
+              }
+              if (!nextRelays.length) {
+                resolveStatus.textContent = "No relays available to resolve your account key. Retrying…";
+                if (accountResolveRetries < 4) scheduleRetry(6000);
+                return;
+              }
+              if (!okRelays.length) {
+                resolveStatus.textContent = "Relays unreachable. Retrying…";
+              }
+
+              const resolved = await nip46RequestPublicKey(session, getDefaultTimeoutMs());
+              if (!resolved) {
+                resolveStatus.textContent = "Still couldn't resolve your account key. Retrying…";
+                if (accountResolveRetries < 4) scheduleRetry(5000);
+                return;
+              }
+              signedInPubkey = normalizeHexPubkey(resolved);
+              accountResolveRetries = 0;
+              if (accountResolveTimer) {
+                clearTimeout(accountResolveTimer);
+                accountResolveTimer = null;
+              }
+              await setActiveAuth({
+                type: "nip46",
+                pubkey: resolved,
+                remotePubkey: session.remotePubkey || getActiveRemotePubkey(),
+                sessionId: sessionId || session.id,
+              });
+              updateAuthUi();
+              if (parseRoute(window.location.hash).name === "profile") {
+                await renderProfile(signedInPubkey, { isSelf: true });
+              }
+            } catch (err) {
+              resolveStatus.textContent = `Resolve failed: ${err?.message || String(err)}`;
+              if (accountResolveRetries < 4) scheduleRetry(6000);
+            } finally {
+              accountResolveInFlight = false;
+              retryBtn.disabled = false;
+            }
+          };
+
+          retryBtn.addEventListener("click", attemptResolve);
+          if (!accountResolveInFlight && !accountResolveTimer) attemptResolve();
+          setPageTitle(["Profile"]);
+          return;
+        }
       }
-      return await renderProfile(signedInPubkey, { isSelf: true });
+      const targetPubkey = effectiveAccountPubkey || signedInPubkey;
+      return await renderProfile(targetPubkey, { isSelf: true });
     }
     if (route.name === "profile_view") return await renderProfile(route.pubkeyHex, { isSelf: false });
     if (route.name === "not_found") {
@@ -5519,6 +5913,17 @@ window.addEventListener("error", (event) => {
 
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event?.reason;
+  const reasonMessage = String(reason?.message || reason || "").toLowerCase();
+  // Ignore expected nostr-tools relay teardown noise.
+  if (
+    reasonMessage.includes("relay connection closed by us") ||
+    reasonMessage.includes("relay connection errored") ||
+    reasonMessage.includes("websocket error")
+  ) {
+    event.preventDefault();
+    console.warn("[YOYOSTR] Ignoring expected relay close rejection.", reason);
+    return;
+  }
   const err = reason instanceof Error ? reason : new Error(typeof reason === "string" ? reason : String(reason));
   showVisibleError(err, { title: "Unhandled rejection" });
 });

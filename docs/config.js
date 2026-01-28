@@ -3,6 +3,7 @@ export const RELAYS = [
   "wss://nos.lol",
   "wss://relay.nostr.band",
   "wss://relay.snort.social",
+  "wss://relay.primal.net",
 ];
 
 export const MAINTAINER_NPUB =

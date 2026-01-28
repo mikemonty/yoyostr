@@ -1109,17 +1109,18 @@ export async function fetchProfile(pubkeyHex, options = {}) {
   const events = await fetchEventsFromRelays(filter, options);
   events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
 
-  const latest = events[0];
-  if (!latest || typeof latest.content !== "string") return null;
-
-  let profile;
-  try {
-    profile = JSON.parse(latest.content);
-  } catch {
-    profile = null;
+  for (const ev of events) {
+    if (!ev || typeof ev.content !== "string") continue;
+    let profile;
+    try {
+      profile = JSON.parse(ev.content);
+    } catch {
+      profile = null;
+    }
+    if (!profile || typeof profile !== "object") continue;
+    return { pubkey, created_at: toNumberOrNull(ev.created_at) ?? 0, ...profile };
   }
-  if (!profile || typeof profile !== "object") profile = {};
-  return { pubkey, created_at: toNumberOrNull(latest.created_at) ?? 0, ...profile };
+  return null;
 }
 
 export async function fetchProfiles(pubkeysHex, options = {}) {
@@ -1138,18 +1139,11 @@ export async function fetchProfiles(pubkeysHex, options = {}) {
   const filter = { kinds: [0], authors: unique.slice(0, 60), limit };
   const events = await fetchEventsFromRelays(filter, options);
 
-  const latestByPubkey = new Map(); // pubkey -> event
+  const out = {};
+  events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
   for (const ev of events) {
     const pubkey = normalizeHexPubkey(ev?.pubkey);
-    if (!pubkey) continue;
-    const createdAt = toNumberOrNull(ev?.created_at) ?? 0;
-    const prev = latestByPubkey.get(pubkey);
-    const prevAt = toNumberOrNull(prev?.created_at) ?? 0;
-    if (!prev || createdAt > prevAt) latestByPubkey.set(pubkey, ev);
-  }
-
-  const out = {};
-  for (const [pubkey, ev] of latestByPubkey.entries()) {
+    if (!pubkey || out[pubkey]) continue;
     if (typeof ev?.content !== "string") continue;
     let profile;
     try {
@@ -1157,7 +1151,7 @@ export async function fetchProfiles(pubkeysHex, options = {}) {
     } catch {
       profile = null;
     }
-    if (!profile || typeof profile !== "object") profile = {};
+    if (!profile || typeof profile !== "object") continue;
     out[pubkey] = { pubkey, created_at: toNumberOrNull(ev?.created_at) ?? 0, ...profile };
   }
   return out;
@@ -1205,7 +1199,7 @@ export async function fetchYoyostrPostsByAuthor(pubkeyHex, options = {}) {
 // Fetch kind-1 posts by author that are not tagged with the YoYoStr app tag.
 export async function fetchOtherPostsByAuthor(pubkeyHex, options = {}) {
   const pubkey = normalizeHexPubkey(pubkeyHex);
-  if (!pubkey) return [];
+  if (!pubkey) return { events: [], cursorUntil: null, rawCount: 0 };
 
   const limit = toNumberOrNull(options.limit) ?? 50;
   const filter = { kinds: [1], authors: [pubkey], limit };
@@ -1215,9 +1209,19 @@ export async function fetchOtherPostsByAuthor(pubkeyHex, options = {}) {
   if (until !== null) filter.until = until;
 
   const events = await fetchEventsFromRelays(filter, options);
-  const filtered = events.filter((ev) => !hasTagValue(ev?.tags, "t", APP_TAG));
+  const raw = Array.isArray(events) ? events : [];
+  const filtered = raw.filter((ev) => !hasTagValue(ev?.tags, "t", APP_TAG));
   filtered.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
-  return filtered.slice(0, limit);
+
+  const oldest = raw.reduce((min, ev) => {
+    const ts = toNumberOrNull(ev?.created_at);
+    if (ts === null) return min;
+    if (min === null || ts < min) return ts;
+    return min;
+  }, null);
+  const cursorUntil = typeof oldest === "number" ? Math.max(0, oldest - 1) : null;
+
+  return { events: filtered.slice(0, limit), cursorUntil, rawCount: raw.length };
 }
 
 export async function fetchProofsForUnit(unitRef, options = {}) {
