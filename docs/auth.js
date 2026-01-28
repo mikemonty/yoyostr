@@ -11,6 +11,7 @@ import {
 import { isNip07Available, getNip07Pubkey, signEventWithNip07 } from "./nip07.js";
 import {
   createNip46Session,
+  getDefaultTimeoutMs,
   nip46RequestPublicKey,
   nip46RequestSignEvent,
 } from "./nip46.js";
@@ -108,7 +109,14 @@ export async function signEvent(event) {
     if (!session || session.status !== "connected" || !session.remotePubkey) {
       throw new Error("Missing NIP-46 session.");
     }
-    return nip46RequestSignEvent(session, event);
+    const signed = await nip46RequestSignEvent(session, event);
+    if (!signed) {
+      if (session?.lastError?.code === "timeout") {
+        throw new Error(session.lastError.message || "Timed out waiting for signer approval.");
+      }
+      throw new Error("Sign event failed.");
+    }
+    return signed;
   }
   throw new Error("No active signer.");
 }
@@ -130,7 +138,7 @@ export async function requestPublicKey() {
   throw new Error("No active signer.");
 }
 
-export async function refreshNip46Pubkey(timeoutMs = 5000) {
+export async function refreshNip46Pubkey(timeoutMs = getDefaultTimeoutMs()) {
   await ensureAuthReady();
   if (getActiveAuthType() !== "nip46") return null;
   const sessionId = getActiveNip46SessionId();

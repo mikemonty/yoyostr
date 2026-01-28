@@ -62,7 +62,7 @@ import {
   nip46ConnectWithBunker,
   nip46RequestPublicKey,
   nip46RequestSignEvent,
-  DEFAULT_TIMEOUT_MS,
+  getDefaultTimeoutMs,
   DEFAULT_PERMS,
 } from "./nip46.js";
 import * as QRCode from "https://esm.sh/qrcode@1.5.3";
@@ -1902,6 +1902,28 @@ async function init() {
       }
     };
 
+    const nip46TimeoutMessage =
+      "Timed out waiting for signer approval. Check your signer app and try again.";
+
+    const resolveNip46TimeoutMs = (value) =>
+      Number.isFinite(value) ? value : getDefaultTimeoutMs();
+
+    const handleNip46Timeout = (method, sessionRecord, result) => {
+      const structuredTimeout =
+        result && typeof result === "object" && result.ok === false && result?.error?.code === "timeout";
+      const sessionTimeout = sessionRecord?.lastError?.code === "timeout";
+      if (!structuredTimeout && !sessionTimeout) return false;
+      const message =
+        (structuredTimeout && result?.error?.message) || sessionRecord?.lastError?.message || nip46TimeoutMessage;
+      setRemoteStatus(message || nip46TimeoutMessage, true);
+      setDebugState({ lastError: message || "timeout" });
+      logDebug("nip46 timeout handled", {
+        method,
+        error: structuredTimeout ? result?.error : sessionRecord?.lastError,
+      });
+      return true;
+    };
+
     const setRemoteStatus = (message, isError) => {
       remoteStatus.textContent = message || "";
       remoteStatus.style.color = isError ? "var(--status-error-color, #b00020)" : "";
@@ -1934,7 +1956,7 @@ async function init() {
 
     const resolveAccountPubkey = async (sessionRecord, options = {}) => {
       const attempts = Number.isFinite(options.attempts) ? options.attempts : 4;
-      const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5000;
+      const timeoutMs = resolveNip46TimeoutMs(options.timeoutMs);
       const delayMs = Number.isFinite(options.delayMs) ? options.delayMs : 900;
       for (let i = 0; i < attempts; i++) {
         try {
@@ -1945,6 +1967,9 @@ async function init() {
           logDebug("request get_public_key", { attempt: i + 1, timeoutMs });
           const resolved = await nip46RequestPublicKey(sessionRecord, timeoutMs);
           if (resolved) return resolved;
+          if (handleNip46Timeout("get_public_key", sessionRecord)) {
+            return null;
+          }
         } catch (err) {
           setDebugState({ lastError: err?.message || "get_public_key failed" });
           logDebug("get_public_key failed", err);
@@ -1957,7 +1982,10 @@ async function init() {
       return null;
     };
 
-    const requestSignaturePubkey = async (sessionRecord, timeoutMs = 5000) => {
+    const requestSignaturePubkey = async (
+      sessionRecord,
+      timeoutMs = getDefaultTimeoutMs()
+    ) => {
       try {
         setRemoteStatus("Connected. Approve the signature request to confirm your account...");
         setDebugState({ lastAction: "requested sign_event probe", lastError: "" });
@@ -1971,6 +1999,9 @@ async function init() {
           pubkey: "",
         };
         const signed = await nip46RequestSignEvent(sessionRecord, probeEvent, timeoutMs);
+        if (!signed && handleNip46Timeout("sign_event", sessionRecord)) {
+          return null;
+        }
         const pk = typeof signed?.pubkey === "string" ? signed.pubkey : "";
         return pk || null;
       } catch (err) {
@@ -2018,7 +2049,7 @@ async function init() {
       (async () => {
         const resolved = await resolveAccountPubkey(sessionRecord, {
           attempts: 6,
-          timeoutMs: 5000,
+          timeoutMs: getDefaultTimeoutMs(),
           delayMs: 1000,
         });
         if (!resolved) return;
@@ -2076,16 +2107,18 @@ async function init() {
 
         const resolvedPubkey = await resolveAccountPubkey(sessionRecord, {
           attempts: 4,
-          timeoutMs: 5000,
+          timeoutMs: getDefaultTimeoutMs(),
           delayMs: 900,
         });
 
         if (!resolvedPubkey) {
           needsSignatureConfirm = true;
-          setRemoteStatus(
-            "Connected, but couldn't read account pubkey. Request signature or continue anyway.",
-            true
-          );
+          if (!handleNip46Timeout("get_public_key", sessionRecord)) {
+            setRemoteStatus(
+              "Connected, but couldn't read account pubkey. Request signature or continue anyway.",
+              true
+            );
+          }
           scannedBtn.textContent = "Request signature";
           scannedBtn.disabled = false;
           pasteBtn.disabled = false;
@@ -2127,9 +2160,15 @@ async function init() {
       try {
         const remotePubkey = await nip46WaitForConnect(
           session,
-          DEFAULT_TIMEOUT_MS,
+          getDefaultTimeoutMs(),
           waitingController.signal
         );
+        if (!remotePubkey && handleNip46Timeout("connect", session, remotePubkey)) {
+          return;
+        }
+        if (!remotePubkey) {
+          throw new Error("Missing remote pubkey.");
+        }
         setDebugState({ remotePubkey: normalizeHexPubkey(remotePubkey) });
         logDebug("signer approved", { remotePubkey });
         await finalizeRemoteConnect(session, remotePubkey);
@@ -2233,8 +2272,8 @@ async function init() {
           ? window.__YOYOSTR_NIP46_TRACE
           : [];
         const traceLines = trace.map((entry) => {
-          const t = entry?.t || "";
-          const step = entry?.step || "";
+          const t = entry?.ts || entry?.t || "";
+          const step = entry?.msg || entry?.step || "";
           let data = "";
           if (entry && entry.data !== undefined) {
             try {
@@ -2269,7 +2308,7 @@ async function init() {
         if (needsSignatureConfirm) {
           scannedBtn.disabled = true;
           pasteBtn.disabled = true;
-          const signedPubkey = await requestSignaturePubkey(currentSession, 6000);
+          const signedPubkey = await requestSignaturePubkey(currentSession, getDefaultTimeoutMs());
           if (!signedPubkey) {
             setRemoteStatus(
               "Signature request failed. Retry or continue anyway to keep going.",
@@ -2351,13 +2390,17 @@ async function init() {
         waitingController = new AbortController();
         setRemoteStatus("Waiting for bunker approval…");
         try {
-          await nip46ConnectWithBunker(
+          const result = await nip46ConnectWithBunker(
             bunkerSession,
             parsed.pubkey,
             parsed.secret,
             parsed.perms,
             waitingController.signal
           );
+          if (!result && handleNip46Timeout("connect", bunkerSession, result)) {
+            setWaitingState(false);
+            return;
+          }
           await finalizeRemoteConnect(bunkerSession, parsed.pubkey);
         } catch (err) {
           await updateNip46Session(bunkerSession.id, { status: "failed" });
@@ -4818,7 +4861,7 @@ async function init() {
           const sessionId = getActiveNip46SessionId();
           const session = await getNip46Session(sessionId);
           if (session && session.status === "connected" && session.remotePubkey) {
-            const refreshed = await nip46RequestPublicKey(session, 5000);
+            const refreshed = await nip46RequestPublicKey(session, getDefaultTimeoutMs());
             if (refreshed && normalizeHexPubkey(refreshed) !== normalizeHexPubkey(signedInPubkey)) {
               signedInPubkey = normalizeHexPubkey(refreshed);
               await setActiveAuth({
