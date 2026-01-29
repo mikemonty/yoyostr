@@ -19,3 +19,9 @@ export const KIND_UNIT = 30079;
 
 // YoYoStr-specific (replaceable) badge display preferences.
 export const KIND_BADGE_PREFS = 30081;
+
+// YoYoStr-specific (replaceable) selected other-posts list.
+export const KIND_SELECTED_OTHER_POSTS = 30082;
+
+// YoYoStr-specific (replaceable) category list for imported posts.
+export const KIND_OTHER_POST_CATEGORIES = 30083;

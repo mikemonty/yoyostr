@@ -74,6 +74,17 @@
       .video-list button[aria-current="true"] { border-color: rgba(127,127,127,.55); background: rgba(127,127,127,.16); }
       .embed-box { border: 1px solid var(--panel-border); border-radius: 14px; overflow: hidden; background: var(--panel-bg); backdrop-filter: blur(10px); }
       .embed-box iframe { width: 100%; height: min(55vh, 520px); border: 0; display: block; }
+      .embed-box video { width: 100%; max-height: min(55vh, 520px); display: block; background: #000; }
+      .post-image-grid { display: grid; gap: 10px; }
+      .post-image { width: 100%; height: auto; display: block; border-radius: 12px; background: #000; }
+      .post-category-row,
+      .post-category-editor { display: flex; flex-wrap: wrap; gap: 8px; }
+      .category-chip { border: 1px solid rgba(127,127,127,.35); padding: 4px 10px; border-radius: 999px; font-size: 12px; background: rgba(127,127,127,.12); }
+      button.category-chip { border: 1px solid rgba(127,127,127,.35); padding: 4px 10px; border-radius: 999px; background: rgba(127,127,127,.12); }
+      .category-chip[aria-pressed="true"] { border-color: rgba(127,127,127,.65); background: rgba(127,127,127,.28); }
+      .category-chip.is-static { cursor: default; }
+      .post-category-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+      .post-category-list { display: flex; flex-wrap: wrap; gap: 8px; }
       .topnav { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
       .topnav a {
         text-decoration: none;
@@ -114,6 +125,7 @@
       }
       .post-menu-list[aria-hidden="false"] { display: grid; gap: 4px; }
       .post-menu-item { width: 100%; text-align: left; padding: 8px 10px; border-radius: 10px; }
+      .post-menu-label { padding: 6px 10px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.7; }
       .post-menu-divider { height: 1px; background: rgba(127,127,127,.25); margin: 4px 0; border-radius: 999px; }
       .post-list { display: grid; gap: 12px; }
       .post-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }

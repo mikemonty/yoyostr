@@ -1,4 +1,13 @@
-import { APP_TAG, KIND_BADGE_PREFS, KIND_TRACK, KIND_UNIT, RELAYS } from "./config.js";
+import {
+  APP_TAG,
+  KIND_BADGE_PREFS,
+  KIND_OTHER_POST_CATEGORIES,
+  KIND_SELECTED_OTHER_POSTS,
+  KIND_TRACK,
+  KIND_UNIT,
+  MAINTAINER_PUBKEY_HEX,
+  RELAYS,
+} from "./config.js";
 import { getActivePubkey, signEvent } from "./auth.js";
 
 const BAD_RELAYS_STORAGE_KEY = "yoyostr_bad_relays_v1";
@@ -191,6 +200,8 @@ function hasTagValue(tags, key, value) {
 }
 
 function toNumberOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
   const num = typeof value === "number" ? value : Number(value);
   return Number.isFinite(num) ? num : null;
 }
@@ -1005,7 +1016,19 @@ export async function fetchBadgePrefs(pubkeyHex, options = {}) {
 
   const prefs = safeParseJsonObject(latest.content);
   const hidden = Array.isArray(prefs.hidden) ? prefs.hidden.filter((x) => typeof x === "string" && x.trim()) : [];
-  return { pubkey, created_at: toNumberOrNull(latest.created_at) ?? 0, hidden };
+  const pinnedEarned = Array.isArray(prefs.pinnedEarned)
+    ? prefs.pinnedEarned.filter((x) => typeof x === "string" && x.trim())
+    : [];
+  const pinnedCreated = Array.isArray(prefs.pinnedCreated)
+    ? prefs.pinnedCreated.filter((x) => typeof x === "string" && x.trim())
+    : [];
+  return {
+    pubkey,
+    created_at: toNumberOrNull(latest.created_at) ?? 0,
+    hidden,
+    pinnedEarned,
+    pinnedCreated,
+  };
 }
 
 function safeParseJsonObject(raw) {
@@ -1018,12 +1041,203 @@ function safeParseJsonObject(raw) {
   }
 }
 
-export async function publishBadgePrefs({ hidden, relays } = {}) {
+const SELECTED_OTHER_POSTS_D = "selected-other-posts";
+const OTHER_POST_CATEGORIES_D = "other-post-categories";
+
+function normalizeCategoryLabel(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return trimmed.toLowerCase().replace(/\s+/g, "-");
+}
+
+function parseSelectedOtherPostsEvent(event) {
+  const ids = new Set();
+  for (const id of getTagValues(event?.tags, "e")) {
+    if (id) ids.add(id);
+  }
+  const payload = safeParseJsonObject(event?.content);
+  const fromContent = Array.isArray(payload?.ids) ? payload.ids : [];
+  for (const id of fromContent) {
+    if (typeof id === "string" && id.trim()) ids.add(id.trim());
+  }
+  const categoriesById = {};
+  const rawMap = payload?.categoriesById && typeof payload.categoriesById === "object" ? payload.categoriesById : null;
+  if (rawMap) {
+    for (const [rawId, rawCats] of Object.entries(rawMap)) {
+      const cleanId = typeof rawId === "string" ? rawId.trim() : "";
+      if (!cleanId) continue;
+      const cats = Array.isArray(rawCats) ? rawCats : [];
+      const normalized = Array.from(
+        new Set(cats.map((cat) => normalizeCategoryLabel(cat)).filter(Boolean))
+      );
+      if (normalized.length) categoriesById[cleanId] = normalized;
+    }
+  }
+  return { ids: Array.from(ids), categoriesById };
+}
+
+export async function fetchSelectedOtherPosts(pubkeyHex, options = {}) {
+  const pubkey = normalizeHexPubkey(pubkeyHex);
+  if (!pubkey) return { ids: [], categoriesById: {} };
+
+  const filter = {
+    kinds: [KIND_SELECTED_OTHER_POSTS],
+    authors: [pubkey],
+    "#d": [SELECTED_OTHER_POSTS_D],
+    limit: 10,
+  };
+  const events = await fetchEventsFromRelays(filter, options);
+  events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+  const latest = events[0];
+  if (!latest) return { ids: [], categoriesById: {} };
+  return parseSelectedOtherPostsEvent(latest);
+}
+
+export async function fetchSelectedOtherPostIds(pubkeyHex, options = {}) {
+  const { ids } = await fetchSelectedOtherPosts(pubkeyHex, options);
+  return ids;
+}
+
+export async function fetchSelectedOtherPostsFromLists(options = {}) {
+  const listLimit = toNumberOrNull(options.listLimit) ?? 200;
+  const maxIds = toNumberOrNull(options.maxIds) ?? 300;
+  const filter = {
+    kinds: [KIND_SELECTED_OTHER_POSTS],
+    "#d": [SELECTED_OTHER_POSTS_D],
+    "#t": [APP_TAG],
+    limit: listLimit,
+  };
+  const events = await fetchEventsFromRelays(filter, options);
+  events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+
+  const latestByPubkey = new Map();
+  for (const ev of events) {
+    const pubkey = normalizeHexPubkey(ev?.pubkey);
+    if (!pubkey || latestByPubkey.has(pubkey)) continue;
+    latestByPubkey.set(pubkey, ev);
+  }
+
+  const ids = [];
+  const seen = new Set();
+  const categoriesById = {};
+  for (const ev of latestByPubkey.values()) {
+    const parsed = parseSelectedOtherPostsEvent(ev);
+    for (const [id, cats] of Object.entries(parsed.categoriesById || {})) {
+      if (!id || categoriesById[id]) continue;
+      categoriesById[id] = cats;
+    }
+    for (const id of parsed.ids) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+      if (ids.length >= maxIds) return { ids, categoriesById };
+    }
+  }
+  return { ids, categoriesById };
+}
+
+export async function fetchSelectedOtherPostIdsFromLists(options = {}) {
+  const { ids } = await fetchSelectedOtherPostsFromLists(options);
+  return ids;
+}
+
+export async function publishSelectedOtherPosts({ ids, categoriesById, relays } = {}) {
+  const pubkey = normalizeHexPubkey(getActivePubkey());
+  if (!pubkey) throw new Error("Missing signer pubkey.");
+
+  const cleaned = Array.isArray(ids)
+    ? Array.from(new Set(ids.map((id) => (typeof id === "string" ? id.trim() : "")).filter(Boolean))).slice(0, 300)
+    : [];
+  const allowed = new Set(cleaned);
+  const cleanedCategories = {};
+  if (categoriesById && typeof categoriesById === "object") {
+    for (const [rawId, rawCats] of Object.entries(categoriesById)) {
+      const id = typeof rawId === "string" ? rawId.trim() : "";
+      if (!id || !allowed.has(id)) continue;
+      const cats = Array.isArray(rawCats) ? rawCats : [];
+      const normalized = Array.from(
+        new Set(cats.map((cat) => normalizeCategoryLabel(cat)).filter(Boolean))
+      );
+      if (normalized.length) cleanedCategories[id] = normalized;
+    }
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const unsignedEvent = {
+    kind: KIND_SELECTED_OTHER_POSTS,
+    created_at: now,
+    tags: [
+      ["d", SELECTED_OTHER_POSTS_D],
+      ["t", APP_TAG],
+      ["t", "selected-other-posts"],
+      ...cleaned.map((id) => ["e", id]),
+    ],
+    content: JSON.stringify({ ids: cleaned, categoriesById: cleanedCategories }),
+    pubkey,
+  };
+
+  const signedEvent = await signEvent(unsignedEvent);
+  const results = await publishEventToRelays(relays || RELAYS, signedEvent);
+  return { signedEvent, results };
+}
+
+export async function fetchOtherPostCategories(options = {}) {
+  const maintainer = normalizeHexPubkey(MAINTAINER_PUBKEY_HEX);
+  if (!maintainer) return [];
+  const filter = {
+    kinds: [KIND_OTHER_POST_CATEGORIES],
+    authors: [maintainer],
+    "#d": [OTHER_POST_CATEGORIES_D],
+    limit: 10,
+  };
+  const events = await fetchEventsFromRelays(filter, options);
+  events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+  const latest = events[0];
+  if (!latest) return [];
+  const payload = safeParseJsonObject(latest.content);
+  const list = Array.isArray(payload?.categories) ? payload.categories : [];
+  return Array.from(new Set(list.map((cat) => normalizeCategoryLabel(cat)).filter(Boolean)));
+}
+
+export async function publishOtherPostCategories({ categories, relays } = {}) {
+  const pubkey = normalizeHexPubkey(getActivePubkey());
+  if (!pubkey) throw new Error("Missing signer pubkey.");
+
+  const cleaned = Array.isArray(categories)
+    ? Array.from(new Set(categories.map((cat) => normalizeCategoryLabel(cat)).filter(Boolean))).slice(0, 100)
+    : [];
+
+  const now = Math.floor(Date.now() / 1000);
+  const unsignedEvent = {
+    kind: KIND_OTHER_POST_CATEGORIES,
+    created_at: now,
+    tags: [
+      ["d", OTHER_POST_CATEGORIES_D],
+      ["t", APP_TAG],
+      ["t", "categories"],
+    ],
+    content: JSON.stringify({ categories: cleaned }),
+    pubkey,
+  };
+
+  const signedEvent = await signEvent(unsignedEvent);
+  const results = await publishEventToRelays(relays || RELAYS, signedEvent);
+  return { signedEvent, results };
+}
+
+export async function publishBadgePrefs({ hidden, pinnedEarned, pinnedCreated, relays } = {}) {
   const pubkey = normalizeHexPubkey(getActivePubkey());
   if (!pubkey) throw new Error("Missing signer pubkey.");
 
   const hiddenList = Array.isArray(hidden)
     ? Array.from(new Set(hidden.map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean))).slice(0, 200)
+    : [];
+  const pinEarnedList = Array.isArray(pinnedEarned)
+    ? Array.from(new Set(pinnedEarned.map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean))).slice(0, 3)
+    : [];
+  const pinCreatedList = Array.isArray(pinnedCreated)
+    ? Array.from(new Set(pinnedCreated.map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean))).slice(0, 3)
     : [];
 
   const now = Math.floor(Date.now() / 1000);
@@ -1035,7 +1249,11 @@ export async function publishBadgePrefs({ hidden, relays } = {}) {
       ["t", APP_TAG],
       ["t", "prefs"],
     ],
-    content: JSON.stringify({ hidden: hiddenList }),
+    content: JSON.stringify({
+      hidden: hiddenList,
+      pinnedEarned: pinEarnedList,
+      pinnedCreated: pinCreatedList,
+    }),
     pubkey,
   };
 
@@ -1063,9 +1281,39 @@ export async function fetchCommunityPosts(options = {}) {
   const limit = toNumberOrNull(options.limit) ?? 50;
   const filter = { kinds: [1, 6, 16], "#t": [APP_TAG], limit };
 
-  const events = await fetchEventsFromRelays(filter, options);
-  events.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
-  return events.slice(0, limit);
+  let events = await fetchEventsFromRelays(filter, options);
+  const includeSelected = options.includeSelected !== false;
+  if (includeSelected) {
+    let selectedIds = [];
+    try {
+      selectedIds = await fetchSelectedOtherPostIdsFromLists({
+        ...options,
+        listLimit: toNumberOrNull(options.listLimit) ?? 200,
+        maxIds: toNumberOrNull(options.maxIds) ?? Math.max(150, limit * 3),
+      });
+    } catch {
+      selectedIds = [];
+    }
+    if (selectedIds.length) {
+      let selectedEvents = [];
+      try {
+        selectedEvents = await fetchPostsByIds(selectedIds, { ...options, limit: selectedIds.length });
+      } catch {
+        selectedEvents = [];
+      }
+      events = [...events, ...selectedEvents];
+    }
+  }
+
+  const byId = new Map();
+  for (const ev of events) {
+    const id = typeof ev?.id === "string" ? ev.id : "";
+    if (!id || byId.has(id)) continue;
+    byId.set(id, ev);
+  }
+  const merged = Array.from(byId.values());
+  merged.sort((a, b) => (toNumberOrNull(b?.created_at) ?? 0) - (toNumberOrNull(a?.created_at) ?? 0));
+  return merged.slice(0, limit);
 }
 
 export async function fetchPostById(eventId, options = {}) {

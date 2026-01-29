@@ -17,12 +17,15 @@ import {
   fetchBadgesCreatedBy,
   fetchBadgePrefs,
   fetchCommunityPosts,
+  fetchOtherPostCategories,
   fetchPostById,
   fetchPostsByIds,
   fetchProfile,
   fetchProfiles,
   fetchProofsForUnit,
   fetchPinnedEventIds,
+  fetchSelectedOtherPosts,
+  fetchSelectedOtherPostsFromLists,
   fetchTracksFromRelays,
   fetchUnitsFromRelays,
   fetchOtherPostsByAuthor,
@@ -32,6 +35,8 @@ import {
   publishBadgeDefinition,
   publishBadgePrefs,
   publishEventToRelays,
+  publishOtherPostCategories,
+  publishSelectedOtherPosts,
 } from "./nostr.js";
 import { getEmbedInfo } from "./embed.js";
 import {
@@ -382,6 +387,13 @@ function slugifyId(value) {
     .slice(0, 48);
 }
 
+function normalizeCategoryLabel(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return trimmed.toLowerCase().replace(/\s+/g, "-");
+}
+
 function makeUniqueBadgeD({ unitRef, name, existingDSet }) {
   const base = `badge:${unitRef}:${slugifyId(name) || Math.random().toString(36).slice(2, 8)}`;
   if (!existingDSet?.has?.(base)) return base;
@@ -399,6 +411,10 @@ function getEmbeddableUrlForEvent(event) {
   urls.push(...getTagValues(base?.tags, "r"));
   urls.push(...extractUrlsFromText(base?.content));
   for (const url of urls) {
+    const directVideo = getDirectVideoUrl(url);
+    if (directVideo) {
+      return { url: directVideo, info: { provider: "file", embedUrl: directVideo, isEmbeddable: true, mediaType: "video" } };
+    }
     const info = getEmbedInfo(url);
     if (info?.isEmbeddable && info?.embedUrl) return { url, info };
   }
@@ -417,18 +433,62 @@ function getEventTitle(event) {
 
 // Detects image URLs in content or "r" tags.
 function isImageEvent(event) {
+  return getImageUrlsForEvent(event).length > 0;
+}
+
+function isImageUrl(raw) {
+  const url = typeof raw === "string" ? raw.trim() : "";
+  if (!url) return false;
+  const clean = url.split(/[?#]/)[0].toLowerCase();
+  return (
+    clean.endsWith(".jpg") ||
+    clean.endsWith(".jpeg") ||
+    clean.endsWith(".png") ||
+    clean.endsWith(".gif") ||
+    clean.endsWith(".webp") ||
+    clean.endsWith(".avif") ||
+    clean.endsWith(".bmp") ||
+    clean.endsWith(".svg")
+  );
+}
+
+function getImageUrlsForEvent(event) {
   const base = getContentEvent(event);
-  if (!base) return false;
+  if (!base) return [];
   const urls = [];
   urls.push(...getTagValues(base?.tags, "r"));
   urls.push(...extractUrlsFromText(base?.content));
+  const out = [];
+  const seen = new Set();
   for (const raw of urls) {
     const url = typeof raw === "string" ? raw.trim() : "";
-    if (!url) continue;
-    const clean = url.split(/[?#]/)[0].toLowerCase();
-    if (clean.endsWith(".jpg") || clean.endsWith(".png") || clean.endsWith(".gif")) return true;
+    if (!url || !isImageUrl(url) || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
   }
-  return false;
+  return out;
+}
+
+function getDirectVideoUrl(raw) {
+  const url = typeof raw === "string" ? raw.trim() : "";
+  if (!url) return "";
+  const clean = url.split(/[?#]/)[0].toLowerCase();
+  if (clean.endsWith(".mp4") || clean.endsWith(".mov")) return url;
+  return "";
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripEmbeddedUrlsFromText(text, urls) {
+  let out = typeof text === "string" ? text : "";
+  const unique = Array.from(new Set((Array.isArray(urls) ? urls : []).filter(Boolean)));
+  for (const url of unique) {
+    const escaped = escapeRegExp(url);
+    out = out.replace(new RegExp(`\\s*${escaped}[),.]*\\s*`, "g"), " ");
+  }
+  return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // Probe relays with a short websocket connect to find reachable ones.
@@ -1217,6 +1277,10 @@ function renderPostMenu(event, options = {}) {
     canPin = false,
     canHide = false,
     isPinned = false,
+    canEditCategories = false,
+    categoryOptions = [],
+    categories = [],
+    onCategoryToggle = null,
     onPin = null,
     onHide = null,
     onShare = null,
@@ -1249,6 +1313,22 @@ function renderPostMenu(event, options = {}) {
     });
   }
 
+  if (canEditCategories && typeof onCategoryToggle === "function") {
+    const active = new Set((Array.isArray(categories) ? categories : []).filter(Boolean));
+    const optionsSet = new Set((Array.isArray(categoryOptions) ? categoryOptions : []).filter(Boolean));
+    for (const cat of active) optionsSet.add(cat);
+    const ordered = Array.from(optionsSet);
+    if (ordered.length) {
+      items.push({ type: "label", label: "Categories" });
+      for (const cat of ordered) {
+        items.push({
+          label: `${active.has(cat) ? "✓ " : ""}${cat}`,
+          action: () => onCategoryToggle?.(event, cat),
+        });
+      }
+    }
+  }
+
   if (!items.length) return null;
 
   const menu = el("div", { class: "post-menu" });
@@ -1265,6 +1345,11 @@ function renderPostMenu(event, options = {}) {
   const list = el("div", { class: "post-menu-list", role: "menu", "aria-hidden": "true" });
 
   const addItem = (item) => {
+    if (item.type === "label") {
+      const label = el("div", { class: "post-menu-label", text: item.label });
+      list.append(label);
+      return;
+    }
     const itemBtn = el("button", { type: "button", class: "post-menu-item", role: "menuitem", text: item.label });
     itemBtn.addEventListener("click", async (ev) => {
       ev.preventDefault();
@@ -1383,6 +1468,10 @@ function renderPostCard(
     selected = false,
     selectionMode = false,
     compact = false,
+    categories = [],
+    categoryOptions = [],
+    categoryEditable = false,
+    onCategoryToggle = null,
     menuOptions = {},
   } = {}
 ) {
@@ -1454,19 +1543,74 @@ function renderPostCard(
     card.append(repostLine);
   }
 
-  if (content) card.append(el("div", { style: "white-space: pre-wrap;" }, [document.createTextNode(content)]));
-
   const embed = getEmbeddableUrlForEvent(event);
+  const imageUrls = getImageUrlsForEvent(event);
+  const displayContent = stripEmbeddedUrlsFromText(content, [embed?.url, ...imageUrls]);
+  if (displayContent) {
+    card.append(el("div", { style: "white-space: pre-wrap;" }, [document.createTextNode(displayContent)]));
+  }
+
+  const normalizedCategories = Array.isArray(categories) ? categories.filter(Boolean) : [];
+  const normalizedOptions = Array.isArray(categoryOptions) ? categoryOptions.filter(Boolean) : [];
+  if (categoryEditable && normalizedOptions.length) {
+    const optionSet = new Set(normalizedOptions);
+    for (const cat of normalizedCategories) optionSet.add(cat);
+    const row = el("div", { class: "post-category-editor" });
+    for (const cat of optionSet) {
+      const isActive = normalizedCategories.includes(cat);
+      const btn = el("button", {
+        type: "button",
+        class: "category-chip",
+        text: cat,
+        "aria-pressed": isActive ? "true" : "false",
+      });
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (typeof onCategoryToggle !== "function") return;
+        const nextState = onCategoryToggle(eventId, cat);
+        btn.setAttribute("aria-pressed", nextState ? "true" : "false");
+      });
+      row.append(btn);
+    }
+    card.append(row);
+  } else if (normalizedCategories.length) {
+    const row = el("div", { class: "post-category-row" });
+    for (const cat of normalizedCategories) {
+      row.append(el("span", { class: "category-chip is-static", text: cat }));
+    }
+    card.append(row);
+  }
+
   if (embed?.info?.embedUrl) {
-    const iframe = el("iframe", {
-      src: embed.info.embedUrl,
-      title: "Embedded video",
-      allow:
-        "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share",
-      allowfullscreen: "true",
-      referrerpolicy: "strict-origin-when-cross-origin",
-    });
-    card.append(el("div", { class: "embed-box" }, [iframe]));
+    if (embed.info.mediaType === "video") {
+      const video = el("video", {
+        src: embed.info.embedUrl,
+        controls: "true",
+        preload: "metadata",
+        playsinline: "true",
+      });
+      card.append(el("div", { class: "embed-box" }, [video]));
+    } else {
+      const iframe = el("iframe", {
+        src: embed.info.embedUrl,
+        title: "Embedded video",
+        allow:
+          "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share",
+        allowfullscreen: "true",
+        referrerpolicy: "strict-origin-when-cross-origin",
+      });
+      card.append(el("div", { class: "embed-box" }, [iframe]));
+    }
+  }
+
+  if (imageUrls.length) {
+    const grid = el("div", { class: "post-image-grid" });
+    for (const url of imageUrls) {
+      const img = el("img", { class: "post-image", src: url, alt: "", loading: "lazy", decoding: "async" });
+      grid.append(img);
+    }
+    card.append(grid);
   }
 
   if (selectable) {
@@ -3160,10 +3304,23 @@ async function init() {
     app.append(feedBox);
 
     let posts = [];
+    let selectedCategoriesById = new Map();
     try {
       posts = await fetchCommunityPosts({ limit: 50, relays: getRelays() });
     } catch {
       posts = [];
+    }
+    try {
+      const selectedMeta = await fetchSelectedOtherPostsFromLists({ relays: getRelays(), listLimit: 200, maxIds: 400 });
+      const rawMap =
+        selectedMeta?.categoriesById && typeof selectedMeta.categoriesById === "object"
+          ? selectedMeta.categoriesById
+          : {};
+      selectedCategoriesById = new Map(
+        Object.entries(rawMap).map(([id, cats]) => [id, Array.isArray(cats) ? cats.filter(Boolean) : []])
+      );
+    } catch {
+      selectedCategoriesById = new Map();
     }
     if (seq !== renderSeq) return;
 
@@ -3200,7 +3357,12 @@ async function init() {
         return;
       }
       for (const ev of events) {
-        const card = renderPostCard(ev, { linkDate: true, menuOptions: { statusEl, portal: document.body } });
+        const categories = selectedCategoriesById.get(ev?.id) || [];
+        const card = renderPostCard(ev, {
+          linkDate: true,
+          categories,
+          menuOptions: { statusEl, portal: document.body },
+        });
         const pubkeyHex = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
         const profile = pubkeyHex ? profilesByPubkey.get(pubkeyHex) : null;
         const authorEl = card.querySelector?.('[data-role="author"]');
@@ -3930,6 +4092,63 @@ async function init() {
     app.append(el("h3", { text: "Earned badges", style: "margin: 16px 0 10px;" }));
     const badgesBox = el("div", {}, [el("p", { class: "muted", text: "Loading badges…" })]);
     app.append(badgesBox);
+    const maxPinnedBadges = 3;
+    let badgePrefsCache = null;
+    let badgePrefsPromise = null;
+    let badgePinsInitialized = false;
+    let badgeHiddenSet = new Set();
+    const badgePins = { earned: [], created: [] };
+
+    const normalizeBadgeAddrList = (list, limit) => {
+      const cleaned = Array.isArray(list)
+        ? Array.from(new Set(list.map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean)))
+        : [];
+      if (Number.isFinite(limit)) return cleaned.slice(0, limit);
+      return cleaned;
+    };
+
+    const loadBadgePrefs = async () => {
+      if (badgePrefsPromise) return badgePrefsPromise;
+      badgePrefsPromise = (async () => {
+        try {
+          return await fetchBadgePrefs(pubkey, { relays: getRelays() });
+        } catch {
+          return null;
+        }
+      })();
+      badgePrefsCache = await badgePrefsPromise;
+      return badgePrefsCache;
+    };
+
+    const initBadgePinsFromPrefs = (prefs) => {
+      if (badgePinsInitialized || !prefs) return;
+      badgePins.earned = normalizeBadgeAddrList(prefs.pinnedEarned, maxPinnedBadges);
+      badgePins.created = normalizeBadgeAddrList(prefs.pinnedCreated, maxPinnedBadges);
+      badgePinsInitialized = true;
+    };
+
+    const getHiddenList = () => Array.from(badgeHiddenSet.values());
+
+    const saveBadgePrefs = async (statusEl) => {
+      if (!canSign()) {
+        if (statusEl) statusEl.textContent = "Signer unavailable. Connect a signer.";
+        return false;
+      }
+      const hidden = getHiddenList();
+      const pinnedEarned = normalizeBadgeAddrList(badgePins.earned, maxPinnedBadges);
+      const pinnedCreated = normalizeBadgeAddrList(badgePins.created, maxPinnedBadges);
+      if (statusEl) statusEl.textContent = "Signing…";
+      try {
+        const { signedEvent, results } = await publishBadgePrefs({ hidden, pinnedEarned, pinnedCreated });
+        logRelayResults("badge prefs publish results", results);
+        const ok = Object.values(results).some((r) => r?.ok);
+        if (statusEl) statusEl.textContent = ok ? `Saved (${signedEvent.id}).` : "Save failed (no relays reported OK).";
+        return ok;
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Save failed: ${err?.message || String(err)}`;
+        return false;
+      }
+    };
 
     const loadEarnedBadges = async () => {
       let awarded = null;
@@ -3945,7 +4164,11 @@ async function init() {
       }
       if (seq !== renderSeq) return;
 
-      const hiddenSet = new Set(Array.isArray(badgePrefs?.hidden) ? badgePrefs.hidden : []);
+      badgePrefsCache = badgePrefs;
+      badgePrefsPromise = Promise.resolve(badgePrefs);
+      initBadgePinsFromPrefs(badgePrefs);
+      badgeHiddenSet = new Set(Array.isArray(badgePrefs?.hidden) ? badgePrefs.hidden : []);
+      const hiddenSet = badgeHiddenSet;
       const latestAwardByAddr = new Map(); // addr -> { addr, def, awardAt }
       for (const ev of awarded?.awards || []) {
         const addr = getTagValues(ev?.tags, "a")[0] || "";
@@ -3960,17 +4183,57 @@ async function init() {
 
       const earnedBadges = Array.from(latestAwardByAddr.values()).sort((a, b) => b.awardAt - a.awardAt);
       const visibleBadges = earnedBadges.filter((b) => !hiddenSet.has(b.addr));
+      let showAllEarned = false;
 
-      const renderBadgeCards = (badges, { editable } = {}) => {
+      const togglePinnedEarned = (addr, statusEl) => {
+        const list = badgePins.earned;
+        const idx = list.indexOf(addr);
+        if (idx >= 0) {
+          list.splice(idx, 1);
+          if (statusEl) statusEl.textContent = "Unpinned. Click Save to publish.";
+          return false;
+        }
+        if (list.length >= maxPinnedBadges) {
+          if (statusEl) statusEl.textContent = `You can pin up to ${maxPinnedBadges} badges.`;
+          return false;
+        }
+        list.push(addr);
+        if (statusEl) statusEl.textContent = "Pinned. Click Save to publish.";
+        return true;
+      };
+
+      const saveBtn = el("button", { type: "button", text: "Save badge display settings" });
+      const saveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+      if (isOwnProfile) {
+        saveBtn.addEventListener("click", async () => {
+          saveBtn.disabled = true;
+          const ok = await saveBadgePrefs(saveStatus);
+          saveBtn.disabled = false;
+          if (ok) await renderProfile(pubkey, options);
+        });
+      }
+
+      const renderEarnedBadges = () => {
         badgesBox.innerHTML = "";
-        if (!Array.isArray(badges) || badges.length === 0) {
+        const pinnedSet = new Set(badgePins.earned);
+        const pinnedBadges = badgePins.earned
+          .map((addr) => earnedBadges.find((b) => b.addr === addr))
+          .filter(Boolean);
+        const defaultBadges = visibleBadges.slice(0, 3);
+        const displayBadges = showAllEarned
+          ? earnedBadges
+          : pinnedBadges.length
+          ? pinnedBadges
+          : defaultBadges;
+
+        if (!Array.isArray(displayBadges) || displayBadges.length === 0) {
           badgesBox.append(el("p", { class: "muted", text: "No badges yet." }));
-          return { checkboxByAddr: new Map() };
+          return;
         }
 
         const checkboxByAddr = new Map();
         const grid = el("div", { class: "badge-grid" });
-        for (const b of badges) {
+        for (const b of displayBadges) {
           const title = b.def?.name || "Badge";
           const unitRef = typeof b.def?.unitRef === "string" ? b.def.unitRef : "";
           const unit = parseUnitRef(unitRef);
@@ -4002,7 +4265,22 @@ async function init() {
           meta.append(el("div", { class: "muted", text: `Awarded: ${formatTimestamp(b.awardAt)}` }));
           card.append(meta);
 
-          if (editable) {
+          if (isOwnProfile && showAllEarned) {
+            const pinBtn = el("button", {
+              type: "button",
+              class: "badge-pin",
+              text: pinnedSet.has(b.addr) ? "Pinned" : "Pin",
+              "aria-pressed": pinnedSet.has(b.addr) ? "true" : "false",
+            });
+            pinBtn.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              const next = togglePinnedEarned(b.addr, saveStatus);
+              pinBtn.setAttribute("aria-pressed", next ? "true" : "false");
+              pinBtn.textContent = next ? "Pinned" : "Pin";
+            });
+            card.append(pinBtn);
+
             const label = document.createElement("label");
             label.className = "muted";
             label.style.display = "flex";
@@ -4011,6 +4289,11 @@ async function init() {
             const cb = document.createElement("input");
             cb.type = "checkbox";
             cb.checked = !hiddenSet.has(b.addr);
+            cb.addEventListener("change", () => {
+              if (cb.checked) hiddenSet.delete(b.addr);
+              else hiddenSet.add(b.addr);
+              if (saveStatus) saveStatus.textContent = "Updated. Click Save to publish.";
+            });
             label.append(cb, document.createTextNode("Show on profile"));
             card.append(label);
             checkboxByAddr.set(b.addr, cb);
@@ -4019,48 +4302,34 @@ async function init() {
           grid.append(card);
         }
         badgesBox.append(grid);
-        return { checkboxByAddr };
+
+        if (isOwnProfile) {
+          const controls = el("div", {
+            style: "margin-top: 10px; display:flex; gap: 10px; align-items: center; flex-wrap: wrap;",
+          });
+          const toggleBtn = el("button", {
+            type: "button",
+            text: showAllEarned ? "Collapse badges" : "Manage badges",
+          });
+          toggleBtn.addEventListener("click", () => {
+            showAllEarned = !showAllEarned;
+            renderEarnedBadges();
+          });
+          controls.append(toggleBtn, saveBtn, saveStatus);
+          badgesBox.append(controls);
+        } else if (earnedBadges.length > 3 || pinnedBadges.length) {
+          badgesBox.append(
+            el("div", {
+              class: "muted",
+              text: pinnedBadges.length
+                ? "Showing pinned badges."
+                : `Showing ${Math.min(3, visibleBadges.length)} of ${visibleBadges.length}.`,
+            })
+          );
+        }
       };
 
-      const { checkboxByAddr } = renderBadgeCards(isOwnProfile ? earnedBadges : visibleBadges, {
-        editable: isOwnProfile,
-      });
-
-      if (isOwnProfile) {
-        const saveRow = el("div", { style: "margin-top: 10px; display:flex; gap: 10px; align-items: center; flex-wrap: wrap;" });
-        const saveBtn = el("button", { type: "button", text: "Save badge display settings" });
-        const saveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
-        saveRow.append(saveBtn, saveStatus);
-        badgesBox.append(saveRow);
-
-        saveBtn.addEventListener("click", async () => {
-          saveStatus.textContent = "";
-          if (!canSign()) {
-            saveStatus.textContent = "Signer unavailable. Connect a signer.";
-            return;
-          }
-
-          const hidden = [];
-          for (const [addr, cb] of checkboxByAddr.entries()) {
-            if (!cb.checked) hidden.push(addr);
-          }
-
-          saveBtn.disabled = true;
-          saveStatus.textContent = "Signing…";
-          try {
-            const { signedEvent, results } = await publishBadgePrefs({ hidden });
-            logRelayResults("badge prefs publish results", results);
-            const ok = Object.values(results).some((r) => r?.ok);
-            saveStatus.textContent = ok ? `Saved (${signedEvent.id}).` : "Save failed (no relays reported OK).";
-          } catch (err) {
-            saveStatus.textContent = `Save failed: ${err?.message || String(err)}`;
-          } finally {
-            saveBtn.disabled = false;
-          }
-
-          await renderProfile(pubkey, options);
-        });
-      }
+      renderEarnedBadges();
     };
     loadEarnedBadges();
 
@@ -4070,19 +4339,69 @@ async function init() {
 
     const loadCreatedBadges = async () => {
       let createdBadges = [];
+      let prefs = null;
       try {
-        createdBadges = await fetchBadgesCreatedBy(pubkey, { limit: 200, relays: getRelays() });
+        [createdBadges, prefs] = await Promise.all([
+          fetchBadgesCreatedBy(pubkey, { limit: 200, relays: getRelays() }),
+          loadBadgePrefs(),
+        ]);
       } catch {
         createdBadges = [];
+        prefs = null;
       }
       if (seq !== renderSeq) return;
 
-      createdBadgesBox.innerHTML = "";
-      if (!Array.isArray(createdBadges) || createdBadges.length === 0) {
-        createdBadgesBox.append(el("p", { class: "muted", text: "No created badges yet." }));
-      } else {
+      badgePrefsCache = prefs;
+      initBadgePinsFromPrefs(prefs);
+      let showAllCreated = false;
+
+      const togglePinnedCreated = (addr, statusEl) => {
+        const list = badgePins.created;
+        const idx = list.indexOf(addr);
+        if (idx >= 0) {
+          list.splice(idx, 1);
+          if (statusEl) statusEl.textContent = "Unpinned. Click Save to publish.";
+          return false;
+        }
+        if (list.length >= maxPinnedBadges) {
+          if (statusEl) statusEl.textContent = `You can pin up to ${maxPinnedBadges} badges.`;
+          return false;
+        }
+        list.push(addr);
+        if (statusEl) statusEl.textContent = "Pinned. Click Save to publish.";
+        return true;
+      };
+
+      const saveBtn = el("button", { type: "button", text: "Save badge display settings" });
+      const saveStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+      if (isOwnProfile) {
+        saveBtn.addEventListener("click", async () => {
+          saveBtn.disabled = true;
+          const ok = await saveBadgePrefs(saveStatus);
+          saveBtn.disabled = false;
+          if (ok) await renderProfile(pubkey, options);
+        });
+      }
+
+      const renderCreatedBadges = () => {
+        createdBadgesBox.innerHTML = "";
+        if (!Array.isArray(createdBadges) || createdBadges.length === 0) {
+          createdBadgesBox.append(el("p", { class: "muted", text: "No created badges yet." }));
+          return;
+        }
+
+        const pinnedBadges = badgePins.created
+          .map((addr) => createdBadges.find((b) => b?.address === addr))
+          .filter(Boolean);
+        const defaultBadges = createdBadges.slice(0, 3);
+        const displayBadges = showAllCreated
+          ? createdBadges
+          : pinnedBadges.length
+          ? pinnedBadges
+          : defaultBadges;
+
         const grid = el("div", { class: "badge-grid" });
-        for (const def of createdBadges) {
+        for (const def of displayBadges) {
           const title = def?.name || "Badge";
           const address = def?.address || "";
           const href = address ? `#/badge/${encodeURIComponent(address)}` : "#/badges";
@@ -4134,10 +4453,56 @@ async function init() {
           }
           if (address) meta.append(el("div", { class: "muted", text: shortHex(address) }));
           card.append(meta);
+
+          if (isOwnProfile && showAllCreated && address) {
+            const isPinned = badgePins.created.includes(address);
+            const pinBtn = el("button", {
+              type: "button",
+              class: "badge-pin",
+              text: isPinned ? "Pinned" : "Pin",
+              "aria-pressed": isPinned ? "true" : "false",
+            });
+            pinBtn.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              const next = togglePinnedCreated(address, saveStatus);
+              pinBtn.setAttribute("aria-pressed", next ? "true" : "false");
+              pinBtn.textContent = next ? "Pinned" : "Pin";
+            });
+            card.append(pinBtn);
+          }
+
           grid.append(card);
         }
         createdBadgesBox.append(grid);
-      }
+
+        if (isOwnProfile) {
+          const controls = el("div", {
+            style: "margin-top: 10px; display:flex; gap: 10px; align-items: center; flex-wrap: wrap;",
+          });
+          const toggleBtn = el("button", {
+            type: "button",
+            text: showAllCreated ? "Collapse badges" : "Manage badges",
+          });
+          toggleBtn.addEventListener("click", () => {
+            showAllCreated = !showAllCreated;
+            renderCreatedBadges();
+          });
+          controls.append(toggleBtn, saveBtn, saveStatus);
+          createdBadgesBox.append(controls);
+        } else if (createdBadges.length > 3 || pinnedBadges.length) {
+          createdBadgesBox.append(
+            el("div", {
+              class: "muted",
+              text: pinnedBadges.length
+                ? "Showing pinned badges."
+                : `Showing ${Math.min(3, createdBadges.length)} of ${createdBadges.length}.`,
+            })
+          );
+        }
+      };
+
+      renderCreatedBadges();
     };
     loadCreatedBadges();
 
@@ -4164,11 +4529,57 @@ async function init() {
       const postsBox = el("div", {}, [el("p", { class: "muted", text: "Loading posts…" })]);
       yoyostrPane.append(postsBox);
 
+      let applyOtherFilters = null;
+      let renderOtherCategoryList = null;
+      let otherStatus = null;
+      const otherCategoryStorageKey = "yoyostr_other_categories";
+      const defaultOtherCategories = ["yotography", "todaysthrow"];
+      let otherCategories = [...defaultOtherCategories];
+
+      const normalizeCategoryList = (list) =>
+        Array.from(new Set((Array.isArray(list) ? list : []).map((cat) => normalizeCategoryLabel(cat)).filter(Boolean)));
+
+      const applyOtherCategoryList = (list, { persist = true } = {}) => {
+        const normalized = normalizeCategoryList(list);
+        otherCategories = normalized.length ? normalized : [...defaultOtherCategories];
+        if (persist) {
+          try {
+            window?.localStorage?.setItem(otherCategoryStorageKey, JSON.stringify(otherCategories));
+          } catch {
+            // ignore
+          }
+        }
+        if (typeof renderOtherCategoryList === "function") renderOtherCategoryList();
+        if (typeof applyOtherFilters === "function") applyOtherFilters();
+      };
+
+      const readOtherCategories = () => {
+        try {
+          const raw = window?.localStorage?.getItem(otherCategoryStorageKey);
+          const parsed = raw ? JSON.parse(raw) : [];
+          const normalized = normalizeCategoryList(parsed);
+          return normalized.length ? normalized : [...defaultOtherCategories];
+        } catch {
+          return [...defaultOtherCategories];
+        }
+      };
+
+      const loadOtherCategoriesFromRelays = async () => {
+        let remote = [];
+        try {
+          remote = await fetchOtherPostCategories({ relays: getRelays() });
+        } catch {
+          remote = [];
+        }
+        if (remote.length) applyOtherCategoryList(remote, { persist: true });
+      };
+
       const selectedOtherBox = el("div", { style: "margin-top: 12px;" });
       const selectedOtherTitle = el("h4", { text: "Selected Other Posts", style: "margin: 16px 0 10px;" });
       const selectedOtherList = el("div", { class: "post-list" });
       selectedOtherBox.append(selectedOtherTitle, selectedOtherList);
-      if (isOwnProfile) yoyostrPane.append(selectedOtherBox);
+      selectedOtherBox.hidden = true;
+      yoyostrPane.append(selectedOtherBox);
 
       const ensureProfilesForEvents = async (events) => {
         const pubkeys = Array.from(
@@ -4214,6 +4625,10 @@ async function init() {
           selectedIds = new Set(),
           viewMode = "list",
           selectable = true,
+          categoryOptions = [],
+          categoryEditable = false,
+          getCategoriesForId = null,
+          onCategoryToggle = null,
           onSelectionChange = null,
         } = options;
         container.innerHTML = "";
@@ -4226,13 +4641,26 @@ async function init() {
           const eventId = typeof ev?.id === "string" ? ev.id : "";
           const isSelected = eventId ? selectedIds.has(eventId) : false;
           const showSelectionMode = selectable && selectionMode;
+          const categories =
+            typeof getCategoriesForId === "function" && eventId ? getCategoriesForId(eventId) : [];
           const card = renderPostCard(ev, {
             linkDate: true,
             selectable,
             selected: isSelected,
             selectionMode: showSelectionMode,
             compact: viewMode === "grid",
-            menuOptions: { statusEl, portal: document.body },
+            categories,
+            categoryOptions,
+            categoryEditable: categoryEditable && showSelectionMode,
+            onCategoryToggle,
+            menuOptions: {
+              statusEl,
+              portal: document.body,
+              canEditCategories: isOwnProfile,
+              categoryOptions,
+              categories,
+              onCategoryToggle: (ev, cat) => onCategoryToggle?.(ev?.id, cat),
+            },
           });
           const pk = typeof ev?.pubkey === "string" ? normalizeHexPubkey(ev.pubkey) : "";
           const cached = pk ? profilesByPubkey.get(pk) : null;
@@ -4247,9 +4675,10 @@ async function init() {
           if (selectable && eventId) {
             card.addEventListener("click", (evClick) => {
               if (!showSelectionMode) return;
-              if (evClick?.target?.closest?.("a")) {
+              if (evClick?.target?.closest?.("a") || evClick?.target?.closest?.("button")) {
                 evClick.preventDefault();
                 evClick.stopPropagation();
+                return;
               }
               const nextSelected = !selectedIds.has(eventId);
               if (nextSelected) selectedIds.add(eventId);
@@ -4278,6 +4707,110 @@ async function init() {
       };
 
       const selectedOtherPostIds = new Set(readSelectedOtherPostIds());
+      const selectedOtherCategoriesStorageKey = `yoyostr_other_post_categories_${pubkey}`;
+      const readSelectedOtherPostCategories = () => {
+        if (!isOwnProfile) return {};
+        try {
+          const raw = window?.localStorage?.getItem(selectedOtherCategoriesStorageKey);
+          const parsed = raw ? JSON.parse(raw) : {};
+          return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        } catch {
+          return {};
+        }
+      };
+      const selectedOtherCategoriesById = new Map();
+      const seedCategories = readSelectedOtherPostCategories();
+      for (const [id, cats] of Object.entries(seedCategories || {})) {
+        const cleanId = typeof id === "string" ? id.trim() : "";
+        if (!cleanId) continue;
+        const list = Array.isArray(cats) ? cats.map((c) => normalizeCategoryLabel(c)).filter(Boolean) : [];
+        if (list.length) selectedOtherCategoriesById.set(cleanId, new Set(list));
+      }
+      const saveSelectedOtherPostCategories = () => {
+        if (!isOwnProfile) return;
+        const obj = {};
+        for (const [id, cats] of selectedOtherCategoriesById.entries()) {
+          if (!id || !cats || cats.size === 0) continue;
+          obj[id] = Array.from(cats.values());
+        }
+        try {
+          window?.localStorage?.setItem(selectedOtherCategoriesStorageKey, JSON.stringify(obj));
+        } catch {
+          // ignore
+        }
+      };
+      const getCategoriesForId = (eventId) => {
+        const id = typeof eventId === "string" ? eventId.trim() : "";
+        if (!id) return [];
+        const cats = selectedOtherCategoriesById.get(id);
+        return cats ? Array.from(cats.values()) : [];
+      };
+      const toggleCategoryForId = (eventId, category) => {
+        const id = typeof eventId === "string" ? eventId.trim() : "";
+        const cat = normalizeCategoryLabel(category);
+        if (!id || !cat) return false;
+        let set = selectedOtherCategoriesById.get(id);
+        if (!set) {
+          set = new Set();
+          selectedOtherCategoriesById.set(id, set);
+        }
+        if (set.has(cat)) {
+          set.delete(cat);
+          if (set.size === 0) selectedOtherCategoriesById.delete(id);
+          saveSelectedOtherPostCategories();
+          if (otherStatus && isMaintainer) {
+            otherStatus.textContent = "Category updated. Click Display Selected to publish.";
+          }
+          return false;
+        }
+        set.add(cat);
+        saveSelectedOtherPostCategories();
+        if (otherStatus && isMaintainer) {
+          otherStatus.textContent = "Category updated. Click Display Selected to publish.";
+        }
+        return true;
+      };
+
+      const handleCategoryToggle = (eventId, category) => {
+        const next = toggleCategoryForId(eventId, category);
+        if (typeof applyOtherFilters === "function") applyOtherFilters();
+        refreshSelectedOtherPosts();
+        return next;
+      };
+
+      const loadSelectedOtherPostIdsFromRelays = async () => {
+        let remote = { ids: [], categoriesById: {} };
+        try {
+          remote = await fetchSelectedOtherPosts(pubkey, { relays: getRelays() });
+        } catch {
+          remote = { ids: [], categoriesById: {} };
+        }
+        const remoteIds = Array.isArray(remote?.ids) ? remote.ids : [];
+        if (!remoteIds.length && !Object.keys(remote?.categoriesById || {}).length) return false;
+        if (selectedOtherPostIds.size === 0 || !isOwnProfile) {
+          selectedOtherPostIds.clear();
+          for (const id of remoteIds) selectedOtherPostIds.add(id);
+          if (isOwnProfile) {
+            try {
+              window?.localStorage?.setItem(selectedOtherStorageKey, JSON.stringify(remoteIds));
+            } catch {
+              // ignore
+            }
+          }
+        }
+        if (selectedOtherCategoriesById.size === 0 || !isOwnProfile) {
+          selectedOtherCategoriesById.clear();
+          for (const [id, cats] of Object.entries(remote?.categoriesById || {})) {
+            const cleanId = typeof id === "string" ? id.trim() : "";
+            if (!cleanId) continue;
+            const list = Array.isArray(cats) ? cats.map((c) => normalizeCategoryLabel(c)).filter(Boolean) : [];
+            if (!list.length) continue;
+            selectedOtherCategoriesById.set(cleanId, new Set(list));
+          }
+          if (isOwnProfile) saveSelectedOtherPostCategories();
+        }
+        return true;
+      };
       const otherPostsById = new Map();
       const hiddenPostsStorageKey = `yoyostr_hidden_posts_${pubkey}`;
       const readHiddenPostIds = () => {
@@ -4317,15 +4850,24 @@ async function init() {
 
       // Render saved other posts beneath the YoYoStr posts list.
       const renderSelectedOtherPosts = (events) => {
-        if (!isOwnProfile) return;
         selectedOtherList.innerHTML = "";
         if (!Array.isArray(events) || events.length === 0) {
+          if (!isOwnProfile) {
+            selectedOtherBox.hidden = true;
+            return;
+          }
           selectedOtherBox.hidden = false;
           selectedOtherList.append(el("p", { class: "muted", text: "No selected other posts yet." }));
           return;
         }
         selectedOtherBox.hidden = false;
-        renderOtherPostsWithNames(selectedOtherList, events, { viewMode: "list", selectable: false });
+        renderOtherPostsWithNames(selectedOtherList, events, {
+          viewMode: "list",
+          selectable: false,
+          categoryOptions: otherCategories,
+          getCategoriesForId,
+          onCategoryToggle: isOwnProfile ? handleCategoryToggle : null,
+        });
       };
 
       // Resolve saved other-post ids to full events for display.
@@ -4350,7 +4892,9 @@ async function init() {
 
       // Refresh selected other-posts list from saved ids.
       const refreshSelectedOtherPosts = async () => {
-        if (!isOwnProfile) return;
+        if (selectedOtherPostIds.size === 0 || selectedOtherCategoriesById.size === 0) {
+          await loadSelectedOtherPostIdsFromRelays();
+        }
         if (selectedOtherPostIds.size === 0) {
           renderSelectedOtherPosts([]);
           return;
@@ -4490,7 +5034,7 @@ async function init() {
       };
 
       refreshYoyostrPosts();
-      if (isOwnProfile) refreshSelectedOtherPosts();
+      refreshSelectedOtherPosts();
 
       if (isOwnProfile) {
       let otherPosts = [];
@@ -4506,7 +5050,6 @@ async function init() {
       let otherFetchInFlight = false;
       const otherAutoLoadLimit = 4;
       let otherAutoLoadAttempts = 0;
-
       const otherControls = el("div", { class: "post-controls" });
       const searchInput = el("input", {
         type: "search",
@@ -4517,10 +5060,17 @@ async function init() {
       const viewGroup = el("div", { class: "post-filter-group" });
       const selectBtn = el("button", { type: "button", text: "Select" });
       const displayBtn = el("button", { type: "button", text: "Display Selected" });
-      const otherStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
+      otherStatus = el("div", { class: "muted", style: "min-height: 1.2em;" });
       const otherList = el("div", { class: "post-list" }, [
         el("p", { class: "muted", text: "No other posts loaded yet." }),
       ]);
+      const otherCategoryControls = isMaintainer ? el("div", { class: "post-category-controls" }) : null;
+      const otherCategoryInput = isMaintainer
+        ? el("input", { type: "text", placeholder: "Add category…", style: "min-width: 160px;" })
+        : null;
+      const otherCategoryAddBtn = isMaintainer ? el("button", { type: "button", text: "Add Category" }) : null;
+      const otherCategoryList = isMaintainer ? el("div", { class: "post-category-list" }) : null;
+      const otherCategoryStatus = isMaintainer ? el("div", { class: "muted", style: "min-height: 1.2em;" }) : null;
       const loadMoreRow = el("div", { class: "load-more-row" });
       const loadMoreBtn = el("button", { type: "button", text: "Load more" });
       const loadMoreHint = el("div", { class: "muted", text: "" });
@@ -4528,7 +5078,15 @@ async function init() {
       const loadMoreSentinel = el("div", { class: "load-more-sentinel" });
 
       otherControls.append(searchInput, filterGroup, viewGroup, selectBtn, displayBtn);
-      otherPane.append(otherControls, otherStatus, otherList, loadMoreRow, loadMoreSentinel);
+      otherPane.append(otherControls, otherStatus);
+      if (otherCategoryControls) {
+        if (otherCategoryInput) otherCategoryControls.append(otherCategoryInput);
+        if (otherCategoryAddBtn) otherCategoryControls.append(otherCategoryAddBtn);
+        if (otherCategoryList) otherCategoryControls.append(otherCategoryList);
+        otherPane.append(otherCategoryControls);
+        if (otherCategoryStatus) otherPane.append(otherCategoryStatus);
+      }
+      otherPane.append(otherList, loadMoreRow, loadMoreSentinel);
 
       const updateSelectionUi = () => {
         selectBtn.textContent = otherSelectionMode ? "Done Selecting" : "Select";
@@ -4545,8 +5103,53 @@ async function init() {
         else loadMoreHint.textContent = "";
       };
 
+      renderOtherCategoryList = () => {
+        if (!otherCategoryList) return;
+        otherCategoryList.innerHTML = "";
+        for (const cat of otherCategories) {
+          otherCategoryList.append(el("span", { class: "category-chip is-static", text: cat }));
+        }
+      };
+
+      const addOtherCategory = async () => {
+        if (!otherCategoryInput || !otherCategoryStatus) return;
+        otherCategoryStatus.textContent = "";
+        if (!canSign() || !signedInPubkey) {
+          otherCategoryStatus.textContent = "Signer unavailable.";
+          return;
+        }
+        const next = normalizeCategoryLabel(otherCategoryInput.value || "");
+        if (!next) return;
+        if (otherCategories.includes(next)) {
+          otherCategoryInput.value = "";
+          return;
+        }
+        const updated = [...otherCategories, next];
+        applyOtherCategoryList(updated, { persist: true });
+        otherCategoryInput.value = "";
+        otherCategoryStatus.textContent = "Saving categories…";
+        try {
+          const { results } = await publishOtherPostCategories({ categories: updated, relays: getRelays() });
+          const ok = Object.values(results).some((r) => r?.ok);
+          otherCategoryStatus.textContent = ok ? "Categories saved." : "Save failed (no relays reported OK).";
+        } catch (err) {
+          otherCategoryStatus.textContent = `Save failed: ${err?.message || String(err)}`;
+        }
+      };
+
+      if (otherCategoryAddBtn) otherCategoryAddBtn.addEventListener("click", addOtherCategory);
+      if (otherCategoryInput) {
+        otherCategoryInput.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            addOtherCategory();
+          }
+        });
+      }
+
+
       // Persist selected other-post ids so they can be displayed on the profile.
-      const saveSelectedOtherPosts = async (eventIds) => {
+      const saveSelectedOtherPosts = async (eventIds, { publish = true } = {}) => {
         const ids = Array.isArray(eventIds)
           ? Array.from(
               new Set(
@@ -4562,6 +5165,18 @@ async function init() {
           window?.localStorage?.setItem(selectedOtherStorageKey, JSON.stringify(ids));
         } catch {
           // ignore
+        }
+        if (publish) {
+          const categoriesById = {};
+          for (const id of ids) {
+            const cats = getCategoriesForId(id);
+            if (cats.length) categoriesById[id] = cats;
+          }
+          const { results } = await publishSelectedOtherPosts({ ids, categoriesById, relays: getRelays() });
+          const ok = Object.values(results).some((r) => r?.ok);
+          if (!ok) {
+            throw new Error("Publish failed (no relays reported OK).");
+          }
         }
         updateSelectionUi();
         await refreshSelectedOtherPosts();
@@ -4637,13 +5252,17 @@ async function init() {
         return filtered;
       };
 
-      const applyOtherFilters = () => {
+      applyOtherFilters = () => {
         const filtered = getFilteredOtherPosts();
         renderOtherPostsWithNames(otherList, filtered, {
           selectionMode: otherSelectionMode,
           selectedIds: selectedOtherPostIds,
           viewMode: otherViewMode,
           selectable: true,
+          categoryOptions: otherCategories,
+          categoryEditable: isMaintainer,
+          getCategoriesForId,
+          onCategoryToggle: handleCategoryToggle,
           onSelectionChange: updateSelectionUi,
         });
         ensureProfilesForEvents(filtered).then((changed) => {
@@ -4655,10 +5274,18 @@ async function init() {
             selectedIds: selectedOtherPostIds,
             viewMode: otherViewMode,
             selectable: true,
+            categoryOptions: otherCategories,
+            categoryEditable: isMaintainer,
+            getCategoriesForId,
+            onCategoryToggle: handleCategoryToggle,
             onSelectionChange: updateSelectionUi,
           });
         });
       };
+
+      applyOtherCategoryList(readOtherCategories(), { persist: false });
+      loadOtherCategoriesFromRelays();
+      refreshSelectedOtherPosts();
 
       const mergeOtherPosts = (events) => {
         const list = Array.isArray(events) ? events : [];
@@ -4717,11 +5344,15 @@ async function init() {
         const cursorUntil = typeof response?.cursorUntil === "number" ? response.cursorUntil : null;
         const added = mergeOtherPosts(fetched);
         updateOtherFetchCursor(cursorUntil);
-        if (!hadError && rawCount === 0) otherHasMore = false;
+        if (!hadError && fetched.length === 0) {
+          if (rawCount < otherFetchLimit || cursorUntil == null) {
+            otherHasMore = false;
+          }
+        }
         otherFetchInFlight = false;
         updateLoadMoreUi();
         if (hadError) otherStatus.textContent = "Load more failed. Try again.";
-        else if (rawCount === 0) otherStatus.textContent = "No more posts found.";
+        else if (!otherHasMore && fetched.length === 0) otherStatus.textContent = "No more posts found.";
         else otherStatus.textContent = "";
         applyOtherFilters();
       };
@@ -4759,11 +5390,24 @@ async function init() {
 
       displayBtn.addEventListener("click", async () => {
         otherStatus.textContent = "";
+        if (!canSign()) {
+          otherStatus.textContent = "Signer unavailable. Connect a signer.";
+          return;
+        }
+        if (!signedInPubkey) {
+          otherStatus.textContent = "Not signed in.";
+          return;
+        }
         const ids = Array.from(selectedOtherPostIds);
         otherStatus.textContent = "Saving selection…";
-        await saveSelectedOtherPosts(ids);
-        if (seq !== renderSeq) return;
-        otherStatus.textContent = "Saved.";
+        try {
+          await saveSelectedOtherPosts(ids, { publish: true });
+          if (seq !== renderSeq) return;
+          otherStatus.textContent = "Saved.";
+        } catch (err) {
+          if (seq !== renderSeq) return;
+          otherStatus.textContent = `Save failed: ${err?.message || String(err)}`;
+        }
       });
 
       updateSelectionUi();
